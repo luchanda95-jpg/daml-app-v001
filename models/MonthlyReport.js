@@ -1,18 +1,19 @@
 // models/MonthlyReport.js
 const mongoose = require('mongoose');
+const { Schema } = mongoose;
 
+/**
+ * Normalize date to UTC month start (YYYY-MM-01T00:00:00Z)
+ */
 function normalizeToUtcMonthStart(dateInput) {
   const d = new Date(dateInput);
   if (isNaN(d.getTime())) return null;
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1, 0, 0, 0));
 }
 
-const MonthlyReportSchema = new mongoose.Schema({
+const MonthlyReportSchema = new Schema({
   branch: { type: String, required: true, trim: true, index: true },
-
-  // normalized to month-start UTC (first day of month at 00:00:00 UTC)
-  date: { type: Date, required: true, index: true },
-
+  date: { type: Date, required: true, index: true }, // normalized month start
   expected: { type: Number, default: 0 },
   inputs: { type: Number, default: 0 },
   collected: { type: Number, default: 0 },
@@ -40,9 +41,7 @@ const MonthlyReportSchema = new mongoose.Schema({
   clearance: { type: Number, default: 0 },
   totalCollections: { type: Number, default: 0 },
   permicCashAdvance: { type: Number, default: 0 },
-
   synced: { type: Boolean, default: false, index: true },
-
   updatedAt: { type: Date, default: () => new Date() },
   createdAt: { type: Date, default: () => new Date() }
 }, {
@@ -51,22 +50,18 @@ const MonthlyReportSchema = new mongoose.Schema({
   versionKey: false
 });
 
-// Unique compound index: branch + date
 MonthlyReportSchema.index({ branch: 1, date: 1 }, { unique: true });
 
-// Normalize date to month-start UTC before save
-MonthlyReportSchema.pre('save', function (next) {
+MonthlyReportSchema.pre('validate', function(next) {
   if (this.date) {
     const normalized = normalizeToUtcMonthStart(this.date);
     if (normalized) this.date = normalized;
   }
-  this.updatedAt = this.updatedAt ? new Date(this.updatedAt) : new Date();
-  if (!this.createdAt) this.createdAt = new Date();
+  this.updatedAt = new Date();
   next();
 });
 
-// Normalize for findOneAndUpdate/upserts and set updatedAt
-MonthlyReportSchema.pre('findOneAndUpdate', function (next) {
+MonthlyReportSchema.pre('findOneAndUpdate', function(next) {
   const upd = this.getUpdate && this.getUpdate();
   if (upd && upd.$set && upd.$set.date) {
     const normalized = normalizeToUtcMonthStart(upd.$set.date);
@@ -79,8 +74,7 @@ MonthlyReportSchema.pre('findOneAndUpdate', function (next) {
   next();
 });
 
-// toJSON: convert dates to ISO strings
-MonthlyReportSchema.method('toJSON', function () {
+MonthlyReportSchema.method('toJSON', function() {
   const obj = this.toObject({ getters: true, virtuals: false });
   if (obj.date) obj.date = new Date(obj.date).toISOString();
   if (obj.updatedAt) obj.updatedAt = new Date(obj.updatedAt).toISOString();

@@ -1,15 +1,3 @@
-/**
- * server.js
- * Full DAML server (single-file)
- *
- * Usage:
- *  - Start: node server.js
- *  - Seed dev admins: node server.js --seed
- *
- * Environment (.env):
- *  MONGO_URI, PORT, JWT_SECRET, JWT_EXPIRES_IN, OVERALL_ADMIN_EMAIL
- */
-
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
@@ -193,6 +181,45 @@ const DailyReportSchema = new Schema({
 });
 DailyReportSchema.index({ branch: 1, date: 1 }, { unique: true });
 const DailyReport = mongoose.model('DailyReport', DailyReportSchema);
+
+// ---------- ZanacoDistribution model ----------
+/**
+ * Stores Zanaco distributions: one document per (date, branch, channel)
+ * Example: { date: 2025-10-12T00:00:00Z, branch: 'Lusaka', channel: 'airtel', amount: 150, metadata: {...} }
+ */
+function normalizeToUtcDay(dateInput) {
+  const d = new Date(dateInput);
+  if (isNaN(d.getTime())) return null;
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0));
+}
+
+const ZanacoDistributionSchema = new Schema({
+  date: { type: Date, required: true, index: true },
+  branch: { type: String, required: true, trim: true, index: true },
+  channel: { type: String, required: true, trim: true, lowercase: true, index: true },
+  amount: { type: Number, required: true, default: 0 },
+  metadata: { type: Schema.Types.Mixed, default: {} }
+}, {
+  timestamps: true,
+  versionKey: false
+});
+ZanacoDistributionSchema.index({ date: 1, branch: 1, channel: 1 }, { unique: true });
+
+ZanacoDistributionSchema.pre('validate', function(next) {
+  if (this.date) {
+    const n = normalizeToUtcDay(this.date);
+    if (n) this.date = n;
+  }
+  next();
+});
+
+ZanacoDistributionSchema.method('toJSON', function () {
+  const obj = this.toObject({ getters: true, virtuals: false });
+  if (obj.date) obj.date = new Date(obj.date).toISOString();
+  return obj;
+});
+
+const ZanacoDistribution = mongoose.model('ZanacoDistribution', ZanacoDistributionSchema);
 
 // ---------- MonthlyReport model ----------
 function normalizeToUtcMonthStart(dateInput) {
@@ -483,7 +510,7 @@ adminRouter.delete('/submissions/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Reports router (daily + monthly). Mirrors the file you pasted earlier (bulk upsert + fetch + delete)
+// Reports router (daily + monthly + zanaco)
 const reportsRouter = express.Router();
 
 // Helpers for numeric coercion reused
@@ -610,6 +637,59 @@ reportsRouter.get('/reports', async (req, res) => {
   }
 });
 
+reportsRouter.get('/reports/query', async (req, res) => {
+  try {
+    const { branch, date } = req.query;
+    if (!branch || !date) return res.status(400).json({ success: false, error: 'branch and date required' });
+    const norm = normalizeDateToDay(date);
+    if (!norm) return res.status(400).json({ success: false, error: 'invalid date' });
+    const doc = await DailyReport.findOne({ branch: String(branch).trim(), date: norm }).lean();
+    return res.json({ success: true, report: doc });
+  } catch (err) {
+    console.error('GET /reports/query error:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+  }
+});
+
+reportsRouter.post('/report', async (req, res) => {
+  try {
+    const raw = req.body || {};
+    const branch = raw.branch ? String(raw.branch).trim() : '';
+    const dateNorm = normalizeDateToDay(raw.date);
+    if (!branch || !dateNorm) return res.status(400).json({ success: false, error: 'branch and valid date required' });
+
+    const openingBalances = sanitizeNumericMap(raw.openingBalances);
+    const closingBalances = sanitizeNumericMap(raw.closingBalances);
+    const loanCounts = sanitizeIntegerMap(raw.loanCounts);
+
+    const updateData = {
+      branch,
+      date: dateNorm,
+      openingBalances,
+      loanCounts,
+      closingBalances,
+      totalDisbursed: toNumber(raw.totalDisbursed),
+      totalCollected: toNumber(raw.totalCollected),
+      collectedForOtherBranches: toNumber(raw.collectedForOtherBranches),
+      pettyCash: toNumber(raw.pettyCash),
+      expenses: toNumber(raw.expenses),
+      synced: true,
+      updatedAt: raw.updatedAt ? new Date(raw.updatedAt) : new Date()
+    };
+
+    const doc = await DailyReport.findOneAndUpdate(
+      { branch, date: dateNorm },
+      { $set: updateData, $setOnInsert: { createdAt: new Date() } },
+      { upsert: true, new: true }
+    );
+
+    return res.json({ success: true, report: doc });
+  } catch (err) {
+    console.error('POST /report error:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+  }
+});
+
 reportsRouter.delete('/reports', async (req, res) => {
   try {
     const { branch, date } = req.body;
@@ -639,6 +719,117 @@ reportsRouter.delete('/reports/:id', async (req, res) => {
     return res.json({ success: true, message: 'Report deleted', deletedId: deleted._id.toString() });
   } catch (err) {
     console.error('DELETE /reports/:id error:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+  }
+});
+
+// ---------------- ZANACO endpoints ----------------
+
+/**
+ * GET /zanaco?date=...&branch=...&channel=...
+ * - If branch & channel provided returns { success:true, amount: <num> }
+ * - Otherwise returns { success:true, distributions: [...] }
+ */
+reportsRouter.get('/zanaco', async (req, res) => {
+  try {
+    const { date, branch, channel } = req.query;
+    if (!date) return res.status(400).json({ success: false, error: 'date required' });
+    const norm = normalizeDateToDay(date);
+    if (!norm) return res.status(400).json({ success: false, error: 'invalid date' });
+
+    const q = { date: norm };
+    if (branch) q.branch = String(branch).trim();
+    if (channel) q.channel = String(channel).toLowerCase().trim();
+
+    const docs = await ZanacoDistribution.find(q).lean();
+    if (branch && channel) {
+      return res.json({ success: true, amount: (docs[0] ? docs[0].amount : 0) });
+    }
+    return res.json({ success: true, distributions: docs });
+  } catch (err) {
+    console.error('GET /zanaco error:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+  }
+});
+
+/**
+ * POST /zanaco - upsert a single zanaco allocation
+ * Body: { date, branch, channel, amount, metadata }
+ */
+reportsRouter.post('/zanaco', async (req, res) => {
+  try {
+    const { date, branch, channel, amount, metadata } = req.body || {};
+    if (!date || !branch || !channel) return res.status(400).json({ success: false, error: 'date, branch and channel required' });
+    const norm = normalizeDateToDay(date);
+    if (!norm) return res.status(400).json({ success: false, error: 'invalid date' });
+
+    const filter = { date: norm, branch: String(branch).trim(), channel: String(channel).toLowerCase().trim() };
+    const update = { $set: { date: norm, branch: filter.branch, channel: filter.channel, amount: Number(amount) || 0, metadata: metadata || {} } };
+    const doc = await ZanacoDistribution.findOneAndUpdate(filter, update, { upsert: true, new: true, setDefaultsOnInsert: true });
+    return res.json({ success: true, distribution: doc });
+  } catch (err) {
+    console.error('POST /zanaco error:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+  }
+});
+
+/**
+ * POST /zanaco/bulk - bulk upsert of allocations.
+ * Body: { date, fromBranch, allocations: { 'Lusaka': { 'airtel': 100, 'mtn': 50 }, ... } }
+ */
+reportsRouter.post('/zanaco/bulk', async (req, res) => {
+  try {
+    const { date, fromBranch, allocations } = req.body || {};
+    if (!date || !allocations || typeof allocations !== 'object') {
+      return res.status(400).json({ success: false, error: 'date and allocations are required' });
+    }
+    const norm = normalizeDateToDay(date);
+    if (!norm) return res.status(400).json({ success: false, error: 'invalid date' });
+
+    const ops = [];
+    for (const [targetBranch, chMap] of Object.entries(allocations)) {
+      if (!chMap || typeof chMap !== 'object') continue;
+      for (const [ch, amtRaw] of Object.entries(chMap)) {
+        const channel = String(ch).toLowerCase().trim();
+        const amount = Number(amtRaw) || 0;
+        const filter = { date: norm, branch: String(targetBranch).trim(), channel };
+        const update = {
+          $set: {
+            date: norm,
+            branch: filter.branch,
+            channel,
+            amount,
+            metadata: { fromBranch: fromBranch || null }
+          },
+          $setOnInsert: { createdAt: new Date() }
+        };
+        ops.push({ updateOne: { filter, update, upsert: true } });
+      }
+    }
+
+    if (ops.length === 0) return res.status(400).json({ success: false, error: 'no valid allocations provided' });
+
+    let bulkRes;
+    try {
+      bulkRes = await ZanacoDistribution.bulkWrite(ops, { ordered: false });
+    } catch (bulkErr) {
+      console.error('zanaco bulkWrite error:', bulkErr);
+      // continue and return what we can
+    }
+
+    return res.json({
+      success: true,
+      message: 'Zanaco allocations processed',
+      bulkWriteResult: bulkRes ? {
+        insertedCount: bulkRes.insertedCount || 0,
+        matchedCount: bulkRes.matchedCount || 0,
+        modifiedCount: bulkRes.modifiedCount || 0,
+        upsertedCount: bulkRes.upsertedCount || 0,
+        upsertedIds: bulkRes.upsertedIds || {}
+      } : undefined
+    });
+  } catch (err) {
+    console.error('POST /zanaco/bulk error:', err);
     return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
@@ -816,7 +1007,7 @@ reportsRouter.delete('/monthly_reports/:id', async (req, res) => {
 app.use('/api/auth', authRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/admin', adminRouter);
-app.use('/api', reportsRouter); // provides /api/sync_reports, /api/reports, /api/sync_monthly_reports, /api/monthly_reports
+app.use('/api', reportsRouter); // provides /api/sync_reports, /api/reports, /api/zanaco, /api/sync_monthly_reports, /api/monthly_reports
 
 // Health and root
 app.get('/health', (req, res) => {
@@ -831,7 +1022,7 @@ app.get('/', (req, res) => {
   res.json({
     message: 'DAML Server API',
     version: '1.0.0',
-    endpoints: { health: '/health', sync: '/api/sync_reports', reports: '/api/reports' }
+    endpoints: { health: '/health', sync: '/api/sync_reports', reports: '/api/reports', zanaco: '/api/zanaco' }
   });
 });
 
