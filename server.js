@@ -1,3 +1,4 @@
+// server.js
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
@@ -13,7 +14,7 @@ const app = express();
 const SALT_ROUNDS = 10;
 
 // --- Config
-const mongoUri = process.env.MONGO_URI || process.env.MONGO_URI || process.env.MONGO_URI;
+const mongoUri = process.env.MONGO_URI;
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
@@ -46,47 +47,10 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// --- Mongoose models (embedded in this file for single-file convenience)
-
-// Helper: convert Map-like plain object to JS object with numeric values
-function sanitizeNumericMap(maybe) {
-  if (!maybe || typeof maybe !== 'object') return {};
-  const out = {};
-  for (const [k, v] of Object.entries(maybe)) {
-    const num = (typeof v === 'number') ? v : (v === null || v === '' ? 0 : Number(v));
-    out[k] = Number.isNaN(num) ? 0 : num;
-  }
-  return out;
-}
-function sanitizeIntegerMap(maybe) {
-  if (!maybe || typeof maybe !== 'object') return {};
-  const out = {};
-  for (const [k, v] of Object.entries(maybe)) {
-    if (typeof v === 'number') out[k] = Math.trunc(v);
-    else if (typeof v === 'string') {
-      const asInt = parseInt(v, 10);
-      if (!Number.isNaN(asInt)) out[k] = asInt;
-      else {
-        const asFloat = parseFloat(v);
-        out[k] = Number.isNaN(asFloat) ? 0 : Math.trunc(asFloat);
-      }
-    } else out[k] = 0;
-  }
-  return out;
-}
-function toNumber(v) {
-  if (v == null) return 0;
-  if (typeof v === 'number') return v;
-  if (typeof v === 'string') {
-    const n = Number(v);
-    return Number.isNaN(n) ? 0 : n;
-  }
-  return 0;
-}
-
-// ---------- User model ----------
+// --- Mongoose models (kept here for back-compat; you may split into models/*.js)
 const { Schema } = mongoose;
 
+// -- User
 const NotificationSchema = new Schema({
   id: { type: String, required: true },
   title: String,
@@ -183,10 +147,6 @@ DailyReportSchema.index({ branch: 1, date: 1 }, { unique: true });
 const DailyReport = mongoose.model('DailyReport', DailyReportSchema);
 
 // ---------- ZanacoDistribution model ----------
-/**
- * Stores Zanaco distributions: one document per (date, branch, channel)
- * Example: { date: 2025-10-12T00:00:00Z, branch: 'Lusaka', channel: 'airtel', amount: 150, metadata: {...} }
- */
 function normalizeToUtcDay(dateInput) {
   const d = new Date(dateInput);
   if (isNaN(d.getTime())) return null;
@@ -297,7 +257,44 @@ MonthlyReportSchema.method('toJSON', function () {
 });
 const MonthlyReport = mongoose.model('MonthlyReport', MonthlyReportSchema);
 
-// --- Auth middleware
+// ---------- Helper functions used in many routes ----------
+function sanitizeNumericMap(maybe) {
+  if (!maybe || typeof maybe !== 'object') return {};
+  const out = {};
+  for (const [k, v] of Object.entries(maybe)) {
+    const num = (typeof v === 'number') ? v : (v === null || v === '' ? 0 : Number(v));
+    out[k] = Number.isNaN(num) ? 0 : num;
+  }
+  return out;
+}
+function sanitizeIntegerMap(maybe) {
+  if (!maybe || typeof maybe !== 'object') return {};
+  const out = {};
+  for (const [k, v] of Object.entries(maybe)) {
+    if (typeof v === 'number') out[k] = Math.trunc(v);
+    else if (typeof v === 'string') {
+      const asInt = parseInt(v, 10);
+      if (!Number.isNaN(asInt)) out[k] = asInt;
+      else {
+        const asFloat = parseFloat(v);
+        out[k] = Number.isNaN(asFloat) ? 0 : Math.trunc(asFloat);
+      }
+    } else out[k] = 0;
+  }
+  return out;
+}
+function toNumber(v) {
+  if (v == null) return 0;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string') {
+    const n = Number(v);
+    return Number.isNaN(n) ? 0 : n;
+  }
+  return 0;
+}
+
+// --- Auth middleware (simple version, kept in server for routes here)
+// NOTE: you also have middleware/auth.js — you can unify by moving this out.
 async function authMiddleware(req, res, next) {
   const auth = req.headers['authorization'];
   if (!auth || !auth.startsWith('Bearer ')) {
@@ -317,21 +314,7 @@ async function authMiddleware(req, res, next) {
   }
 }
 
-// --- Helper date normalizers used in reports routes
-function normalizeDateToDay(dateInput) {
-  const d = new Date(dateInput);
-  if (isNaN(d.getTime())) return null;
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-}
-function normalizeDateToMonthStart(dateInput) {
-  const d = new Date(dateInput);
-  if (isNaN(d.getTime())) return null;
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
-}
-
-// --- ROUTES (mounted on /api/*)
-
-// Auth routes (register/login)
+// --- ROUTERS
 const authRouter = express.Router();
 function makeTokenFor(user) {
   const payload = { email: user.email, role: user.role };
@@ -377,9 +360,8 @@ authRouter.post('/login', async (req, res) => {
   }
 });
 
-// Users routes (balances, notifications)
+// Users router
 const usersRouter = express.Router();
-
 usersRouter.get('/:email/balances', authMiddleware, async (req, res) => {
   try {
     const email = req.params.email.toLowerCase().trim();
@@ -391,7 +373,6 @@ usersRouter.get('/:email/balances', authMiddleware, async (req, res) => {
     return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
-
 usersRouter.post('/:email/balances', authMiddleware, async (req, res) => {
   try {
     const email = req.params.email.toLowerCase().trim();
@@ -429,7 +410,6 @@ usersRouter.post('/:email/balances', authMiddleware, async (req, res) => {
     return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
-
 usersRouter.post('/:email/notifications', authMiddleware, async (req, res) => {
   try {
     const email = req.params.email.toLowerCase().trim();
@@ -459,7 +439,7 @@ usersRouter.post('/:email/notifications', authMiddleware, async (req, res) => {
   }
 });
 
-// Admin routes (submissions)
+// Admin router
 const adminRouter = express.Router();
 adminRouter.post('/submissions', authMiddleware, async (req, res) => {
   try {
@@ -510,12 +490,127 @@ adminRouter.delete('/submissions/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Reports router (daily + monthly + zanaco)
+// Reports router (create before defining handlers)
 const reportsRouter = express.Router();
 
-// Helpers for numeric coercion reused
-// sanitizeNumericMap, sanitizeIntegerMap, toNumber defined above
+// === REPORTS ROUTES ===
+// ZANACO endpoints
+reportsRouter.get('/zanaco/distributions', async (req, res) => {
+  try {
+    const { date, branch, channel } = req.query;
+    if (!date) return res.status(400).json({ success: false, error: 'date required' });
 
+    const norm = normalizeToUtcDay(date);
+    if (!norm) return res.status(400).json({ success: false, error: 'invalid date' });
+
+    const q = { date: norm };
+    if (branch) q.branch = String(branch).trim();
+    if (channel) q.channel = String(channel).toLowerCase().trim();
+
+    const docs = await ZanacoDistribution.find(q).lean();
+    return res.json({ success: true, distributions: docs });
+  } catch (err) {
+    console.error('GET /zanaco/distributions error:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+  }
+});
+
+reportsRouter.get('/zanaco', async (req, res) => {
+  try {
+    const { date, branch, channel } = req.query;
+    if (!date) return res.status(400).json({ success: false, error: 'date required' });
+    const norm = normalizeToUtcDay(date);
+    if (!norm) return res.status(400).json({ success: false, error: 'invalid date' });
+
+    const q = { date: norm };
+    if (branch) q.branch = String(branch).trim();
+    if (channel) q.channel = String(channel).toLowerCase().trim();
+
+    const docs = await ZanacoDistribution.find(q).lean();
+    if (branch && channel) {
+      return res.json({ success: true, amount: (docs[0] ? docs[0].amount : 0) });
+    }
+    return res.json({ success: true, distributions: docs });
+  } catch (err) {
+    console.error('GET /zanaco error:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+  }
+});
+
+reportsRouter.post('/zanaco', async (req, res) => {
+  try {
+    const { date, branch, channel, amount, metadata } = req.body || {};
+    if (!date || !branch || !channel) return res.status(400).json({ success: false, error: 'date, branch and channel required' });
+    const norm = normalizeToUtcDay(date);
+    if (!norm) return res.status(400).json({ success: false, error: 'invalid date' });
+
+    const filter = { date: norm, branch: String(branch).trim(), channel: String(channel).toLowerCase().trim() };
+    const update = { $set: { date: norm, branch: filter.branch, channel: filter.channel, amount: Number(amount) || 0, metadata: metadata || {} } };
+    const doc = await ZanacoDistribution.findOneAndUpdate(filter, update, { upsert: true, new: true, setDefaultsOnInsert: true });
+    return res.json({ success: true, distribution: doc });
+  } catch (err) {
+    console.error('POST /zanaco error:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+  }
+});
+
+reportsRouter.post('/zanaco/bulk', async (req, res) => {
+  try {
+    const { date, fromBranch, allocations } = req.body || {};
+    if (!date || !allocations || typeof allocations !== 'object') {
+      return res.status(400).json({ success: false, error: 'date and allocations are required' });
+    }
+    const norm = normalizeToUtcDay(date);
+    if (!norm) return res.status(400).json({ success: false, error: 'invalid date' });
+
+    const ops = [];
+    for (const [targetBranch, chMap] of Object.entries(allocations)) {
+      if (!chMap || typeof chMap !== 'object') continue;
+      for (const [ch, amtRaw] of Object.entries(chMap)) {
+        const channel = String(ch).toLowerCase().trim();
+        const amount = Number(amtRaw) || 0;
+        const filter = { date: norm, branch: String(targetBranch).trim(), channel };
+        const update = {
+          $set: {
+            date: norm,
+            branch: filter.branch,
+            channel,
+            amount,
+            metadata: { fromBranch: fromBranch || null }
+          },
+          $setOnInsert: { createdAt: new Date() }
+        };
+        ops.push({ updateOne: { filter, update, upsert: true } });
+      }
+    }
+
+    if (ops.length === 0) return res.status(400).json({ success: false, error: 'no valid allocations provided' });
+
+    let bulkRes;
+    try {
+      bulkRes = await ZanacoDistribution.bulkWrite(ops, { ordered: false });
+    } catch (bulkErr) {
+      console.error('zanaco bulkWrite error:', bulkErr);
+    }
+
+    return res.json({
+      success: true,
+      message: 'Zanaco allocations processed',
+      bulkWriteResult: bulkRes ? {
+        insertedCount: bulkRes.insertedCount || 0,
+        matchedCount: bulkRes.matchedCount || 0,
+        modifiedCount: bulkRes.modifiedCount || 0,
+        upsertedCount: bulkRes.upsertedCount || 0,
+        upsertedIds: bulkRes.upsertedIds || {}
+      } : undefined
+    });
+  } catch (err) {
+    console.error('POST /zanaco/bulk error:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+  }
+});
+
+// Daily/Monthly report endpoints (keeping your original logic)
 reportsRouter.post('/sync_reports', async (req, res) => {
   try {
     const { reports } = req.body;
@@ -541,7 +636,7 @@ reportsRouter.post('/sync_reports', async (req, res) => {
           continue;
         }
 
-        const normalizedDate = normalizeDateToDay(raw.date);
+        const normalizedDate = normalizeToUtcDay(raw.date);
         if (!normalizedDate) {
           skipped.push({ reason: 'invalid date', item: raw });
           continue;
@@ -636,12 +731,11 @@ reportsRouter.get('/reports', async (req, res) => {
     return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
-
 reportsRouter.get('/reports/query', async (req, res) => {
   try {
     const { branch, date } = req.query;
     if (!branch || !date) return res.status(400).json({ success: false, error: 'branch and date required' });
-    const norm = normalizeDateToDay(date);
+    const norm = normalizeToUtcDay(date);
     if (!norm) return res.status(400).json({ success: false, error: 'invalid date' });
     const doc = await DailyReport.findOne({ branch: String(branch).trim(), date: norm }).lean();
     return res.json({ success: true, report: doc });
@@ -650,12 +744,11 @@ reportsRouter.get('/reports/query', async (req, res) => {
     return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
-
 reportsRouter.post('/report', async (req, res) => {
   try {
     const raw = req.body || {};
     const branch = raw.branch ? String(raw.branch).trim() : '';
-    const dateNorm = normalizeDateToDay(raw.date);
+    const dateNorm = normalizeToUtcDay(raw.date);
     if (!branch || !dateNorm) return res.status(400).json({ success: false, error: 'branch and valid date required' });
 
     const openingBalances = sanitizeNumericMap(raw.openingBalances);
@@ -689,7 +782,6 @@ reportsRouter.post('/report', async (req, res) => {
     return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
-
 reportsRouter.delete('/reports', async (req, res) => {
   try {
     const { branch, date } = req.body;
@@ -710,7 +802,6 @@ reportsRouter.delete('/reports', async (req, res) => {
     return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
-
 reportsRouter.delete('/reports/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -723,118 +814,7 @@ reportsRouter.delete('/reports/:id', async (req, res) => {
   }
 });
 
-// ---------------- ZANACO endpoints ----------------
-
-/**
- * GET /zanaco?date=...&branch=...&channel=...
- * - If branch & channel provided returns { success:true, amount: <num> }
- * - Otherwise returns { success:true, distributions: [...] }
- */
-reportsRouter.get('/zanaco', async (req, res) => {
-  try {
-    const { date, branch, channel } = req.query;
-    if (!date) return res.status(400).json({ success: false, error: 'date required' });
-    const norm = normalizeDateToDay(date);
-    if (!norm) return res.status(400).json({ success: false, error: 'invalid date' });
-
-    const q = { date: norm };
-    if (branch) q.branch = String(branch).trim();
-    if (channel) q.channel = String(channel).toLowerCase().trim();
-
-    const docs = await ZanacoDistribution.find(q).lean();
-    if (branch && channel) {
-      return res.json({ success: true, amount: (docs[0] ? docs[0].amount : 0) });
-    }
-    return res.json({ success: true, distributions: docs });
-  } catch (err) {
-    console.error('GET /zanaco error:', err);
-    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
-  }
-});
-
-/**
- * POST /zanaco - upsert a single zanaco allocation
- * Body: { date, branch, channel, amount, metadata }
- */
-reportsRouter.post('/zanaco', async (req, res) => {
-  try {
-    const { date, branch, channel, amount, metadata } = req.body || {};
-    if (!date || !branch || !channel) return res.status(400).json({ success: false, error: 'date, branch and channel required' });
-    const norm = normalizeDateToDay(date);
-    if (!norm) return res.status(400).json({ success: false, error: 'invalid date' });
-
-    const filter = { date: norm, branch: String(branch).trim(), channel: String(channel).toLowerCase().trim() };
-    const update = { $set: { date: norm, branch: filter.branch, channel: filter.channel, amount: Number(amount) || 0, metadata: metadata || {} } };
-    const doc = await ZanacoDistribution.findOneAndUpdate(filter, update, { upsert: true, new: true, setDefaultsOnInsert: true });
-    return res.json({ success: true, distribution: doc });
-  } catch (err) {
-    console.error('POST /zanaco error:', err);
-    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
-  }
-});
-
-/**
- * POST /zanaco/bulk - bulk upsert of allocations.
- * Body: { date, fromBranch, allocations: { 'Lusaka': { 'airtel': 100, 'mtn': 50 }, ... } }
- */
-reportsRouter.post('/zanaco/bulk', async (req, res) => {
-  try {
-    const { date, fromBranch, allocations } = req.body || {};
-    if (!date || !allocations || typeof allocations !== 'object') {
-      return res.status(400).json({ success: false, error: 'date and allocations are required' });
-    }
-    const norm = normalizeDateToDay(date);
-    if (!norm) return res.status(400).json({ success: false, error: 'invalid date' });
-
-    const ops = [];
-    for (const [targetBranch, chMap] of Object.entries(allocations)) {
-      if (!chMap || typeof chMap !== 'object') continue;
-      for (const [ch, amtRaw] of Object.entries(chMap)) {
-        const channel = String(ch).toLowerCase().trim();
-        const amount = Number(amtRaw) || 0;
-        const filter = { date: norm, branch: String(targetBranch).trim(), channel };
-        const update = {
-          $set: {
-            date: norm,
-            branch: filter.branch,
-            channel,
-            amount,
-            metadata: { fromBranch: fromBranch || null }
-          },
-          $setOnInsert: { createdAt: new Date() }
-        };
-        ops.push({ updateOne: { filter, update, upsert: true } });
-      }
-    }
-
-    if (ops.length === 0) return res.status(400).json({ success: false, error: 'no valid allocations provided' });
-
-    let bulkRes;
-    try {
-      bulkRes = await ZanacoDistribution.bulkWrite(ops, { ordered: false });
-    } catch (bulkErr) {
-      console.error('zanaco bulkWrite error:', bulkErr);
-      // continue and return what we can
-    }
-
-    return res.json({
-      success: true,
-      message: 'Zanaco allocations processed',
-      bulkWriteResult: bulkRes ? {
-        insertedCount: bulkRes.insertedCount || 0,
-        matchedCount: bulkRes.matchedCount || 0,
-        modifiedCount: bulkRes.modifiedCount || 0,
-        upsertedCount: bulkRes.upsertedCount || 0,
-        upsertedIds: bulkRes.upsertedIds || {}
-      } : undefined
-    });
-  } catch (err) {
-    console.error('POST /zanaco/bulk error:', err);
-    return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
-  }
-});
-
-// Monthly routes
+// Monthly report endpoints
 reportsRouter.post('/sync_monthly_reports', async (req, res) => {
   try {
     const { monthlyReports } = req.body;
@@ -860,7 +840,7 @@ reportsRouter.post('/sync_monthly_reports', async (req, res) => {
           continue;
         }
 
-        const normalizedDate = normalizeDateToMonthStart(raw.date);
+        const normalizedDate = normalizeToUtcMonthStart(raw.date);
         if (!normalizedDate) {
           skipped.push({ reason: 'invalid date', item: raw });
           continue;
@@ -960,7 +940,6 @@ reportsRouter.post('/sync_monthly_reports', async (req, res) => {
     return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
-
 reportsRouter.get('/monthly_reports', async (req, res) => {
   try {
     const reports = await MonthlyReport.find().sort({ date: -1 });
@@ -970,7 +949,6 @@ reportsRouter.get('/monthly_reports', async (req, res) => {
     return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
-
 reportsRouter.delete('/monthly_reports', async (req, res) => {
   try {
     const { branch, date } = req.body;
@@ -990,7 +968,6 @@ reportsRouter.delete('/monthly_reports', async (req, res) => {
     return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
-
 reportsRouter.delete('/monthly_reports/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -1003,11 +980,15 @@ reportsRouter.delete('/monthly_reports/:id', async (req, res) => {
   }
 });
 
-// Mount routers
+// --- Mount routers
 app.use('/api/auth', authRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api', reportsRouter); // provides /api/sync_reports, /api/reports, /api/zanaco, /api/sync_monthly_reports, /api/monthly_reports
+
+// Mount imports router AFTER models & other routers (avoids circular require)
+const importsRouter = require('./routes/imports');
+app.use('/api/imports', importsRouter);
 
 // Health and root
 app.get('/health', (req, res) => {
