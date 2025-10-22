@@ -10,6 +10,7 @@ const morgan = require('morgan');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
+
 const app = express();
 const SALT_ROUNDS = 10;
 
@@ -985,6 +986,12 @@ app.use('/api/auth', authRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api', reportsRouter); // provides /api/sync_reports, /api/reports, /api/zanaco, /api/sync_monthly_reports, /api/monthly_reports
+
+// --- Loans router (added) ---
+// Make sure you created models/Loan.js and routes/loans.js as discussed.
+// This mounts the loans router at /api/loans  (routes/loans.js should export a router with path '/' handlers)
+const loansRouter = require('./routes/loans');
+app.use('/api/loans', loansRouter);
 
 // Mount imports router AFTER models & other routers (avoids circular require)
 const importsRouter = require('./routes/imports');
