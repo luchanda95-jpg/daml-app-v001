@@ -1,4 +1,3 @@
-// routes/loans.js
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
@@ -6,6 +5,17 @@ const Loan = require('../models/Loan');
 
 function escapeRegex(s = '') {
   return String(s).replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+}
+
+function normalizePhone(phone) {
+  if (!phone) return '';
+  return phone.replace(/\D/g, '').replace(/^0/, '');
+}
+
+function extractPrimaryName(fullName) {
+  if (!fullName) return '';
+  const parts = fullName.trim().split(/\s+/);
+  return parts.length > 0 ? parts[0] : fullName;
 }
 
 function normalizeLoanForClient(raw) {
@@ -79,69 +89,256 @@ function normalizeLoanForClient(raw) {
   };
 }
 
-// GET /api/loans?email=...&phone=...&name=...&limit=...
+// GET /api/loans?email=...&phone=...&name=...&limit=...&exactMatch=...
 router.get('/', async (req, res) => {
   try {
-    const { email, phone, name, limit } = req.query;
+    const { email, phone, name, limit, exactMatch } = req.query;
     const qLimit = Math.min(parseInt(limit || '50', 10), 200);
-    const or = [];
+    const useExactMatch = exactMatch === 'true';
+    
+    const matchStages = [];
 
+    // Enhanced phone matching with normalization
     if (phone && phone.trim()) {
-      const p = phone.trim();
-      or.push({ borrowerMobile: { $regex: escapeRegex(p), $options: 'i' } });
-      const digits = p.replace(/\D/g, '');
-      if (digits) or.push({ borrowerMobile: { $regex: digits, $options: 'i' } });
-      or.push({ borrowerLandline: { $regex: escapeRegex(p), $options: 'i' } });
-    }
-
-    if (email && email.trim()) {
-      const e = String(email).toLowerCase().trim();
-      or.push({ borrowerEmail: { $regex: `^${escapeRegex(e)}$`, $options: 'i' } });
-      or.push({ borrowerEmail: { $regex: escapeRegex(e), $options: 'i' } });
-    }
-
-    if (name && name.trim()) {
-      const n = name.trim();
-      or.push({ fullName: { $regex: escapeRegex(n), $options: 'i' } });
-      const tokens = n.split(/\s+/).filter(Boolean);
-      if (tokens.length) {
-        or.push({ fullName: { $regex: tokens.join('|'), $options: 'i' } });
+      const cleanPhone = normalizePhone(phone.trim());
+      if (cleanPhone) {
+        if (useExactMatch) {
+          matchStages.push({ 
+            $expr: { 
+              $eq: [
+                { $replaceAll: { input: { $replaceAll: { input: '$borrowerMobile', find: ' ', replacement: '' } }, find: '-', replacement: '' } },
+                cleanPhone
+              ]
+            }
+          });
+        } else {
+          matchStages.push({ 
+            borrowerMobile: { $regex: cleanPhone, $options: 'i' } 
+          });
+        }
       }
     }
 
-    const filter = or.length ? { $or: or } : {};
-    const raws = await Loan.find(filter).limit(qLimit).lean().exec();
+    // Enhanced email matching
+    if (email && email.trim()) {
+      const cleanEmail = email.toLowerCase().trim();
+      if (useExactMatch) {
+        matchStages.push({ borrowerEmail: { $regex: `^${escapeRegex(cleanEmail)}$`, $options: 'i' } });
+      } else {
+        matchStages.push({ borrowerEmail: { $regex: escapeRegex(cleanEmail), $options: 'i' } });
+      }
+    }
+
+    // Enhanced name matching
+    if (name && name.trim()) {
+      const cleanName = name.trim();
+      const primaryName = extractPrimaryName(cleanName);
+      
+      if (useExactMatch) {
+        matchStages.push({ fullName: { $regex: `^${escapeRegex(cleanName)}$`, $options: 'i' } });
+      } else {
+        // Try full name first, then primary name
+        matchStages.push({ fullName: { $regex: escapeRegex(cleanName), $options: 'i' } });
+        if (primaryName !== cleanName) {
+          matchStages.push({ fullName: { $regex: escapeRegex(primaryName), $options: 'i' } });
+        }
+      }
+    }
+
+    const pipeline = [];
+    
+    if (matchStages.length > 0) {
+      pipeline.push({ $match: { $or: matchStages } });
+    }
+
+    // Add scoring and sorting
+    pipeline.push(
+      {
+        $addFields: {
+          matchScore: {
+            $add: [
+              { $cond: [{ $eq: ['$borrowerEmail', email] }, 10, 0] },
+              { $cond: [{ $eq: [{ $replaceAll: { input: { $replaceAll: { input: '$borrowerMobile', find: ' ', replacement: '' } }, find: '-', replacement: '' } }, normalizePhone(phone)] }, 8, 0] },
+              { $cond: [{ $eq: ['$fullName', name] }, 6, 0] },
+              { $cond: [{ $gt: ['$principalAmount', 0] }, 1, 0] }
+            ]
+          }
+        }
+      },
+      { $sort: { matchScore: -1, nextDueDate: 1, createdAt: -1 } },
+      { $limit: qLimit }
+    );
+
+    let raws = [];
+    if (pipeline.length > 0) {
+      raws = await Loan.aggregate(pipeline).exec();
+    } else {
+      raws = await Loan.find().limit(qLimit).lean().exec();
+    }
+
     const loans = raws.map(normalizeLoanForClient);
-    return res.json({ success: true, count: loans.length, loans });
+    
+    // Log matching results for debugging
+    console.log(`Loan query: email=${email}, phone=${phone}, name=${name}, found=${loans.length}`);
+    
+    return res.json({ 
+      success: true, 
+      count: loans.length, 
+      loans,
+      query: { email, phone, name }
+    });
   } catch (err) {
     console.error('GET /api/loans error', err);
-    return res.status(500).json({ success: false, error: 'Internal Server Error' });
+    return res.status(500).json({ 
+      success: false, 
+      error: 'Internal Server Error',
+      message: err.message 
+    });
   }
 });
 
-// GET /api/loans/:id  -> single loan
+// GET /api/loans/:id - Enhanced single loan lookup
 router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    if (!id) return res.status(400).json({ success: false, error: 'id required' });
+    if (!id || id.trim() === '') {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Loan ID is required' 
+      });
+    }
 
-    // Try ObjectId lookup first
     let doc = null;
+    
+    // Try multiple lookup strategies
+    const lookupConditions = [];
+    
+    // ObjectId lookup
     if (mongoose.Types.ObjectId.isValid(id)) {
-      doc = await Loan.findById(id).lean().exec();
+      lookupConditions.push({ _id: new mongoose.Types.ObjectId(id) });
     }
-    if (!doc) {
-      // fallback: find by id string, branchId or other identifying fields
-      doc = await Loan.findOne({ $or: [{ _id: id }, { id: id }, { branchId: id }, { borrowerMobile: id }] }).lean().exec();
+    
+    // String ID lookup
+    lookupConditions.push({ _id: id });
+    lookupConditions.push({ id: id });
+    
+    // Branch ID lookup
+    lookupConditions.push({ branchId: id });
+    
+    // Phone number lookup (with normalization)
+    const cleanPhone = normalizePhone(id);
+    if (cleanPhone) {
+      lookupConditions.push({ 
+        $expr: { 
+          $eq: [
+            { $replaceAll: { input: { $replaceAll: { input: '$borrowerMobile', find: ' ', replacement: '' } }, find: '-', replacement: '' } },
+            cleanPhone
+          ]
+        }
+      });
     }
 
-    if (!doc) return res.status(404).json({ success: false, error: 'Loan not found' });
+    doc = await Loan.findOne({ $or: lookupConditions }).lean().exec();
+
+    if (!doc) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Loan not found',
+        searchedId: id 
+      });
+    }
 
     const normalized = normalizeLoanForClient(doc);
-    return res.json({ success: true, loan: normalized });
+    return res.json({ 
+      success: true, 
+      loan: normalized 
+    });
   } catch (err) {
     console.error('GET /api/loans/:id error', err);
-    return res.status(500).json({ success: false, error: 'Internal Server Error' });
+    return res.status(500).json({ 
+      success: false, 
+      error: 'Internal Server Error',
+      message: err.message 
+    });
+  }
+});
+
+// POST /api/loans/bulk-query - For complex queries
+router.post('/bulk-query', async (req, res) => {
+  try {
+    const { queries, limit = 50 } = req.body;
+    
+    if (!Array.isArray(queries)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Queries array is required' 
+      });
+    }
+
+    const allLoans = [];
+    const processedQueries = new Set();
+
+    for (const query of queries) {
+      const { email, phone, name } = query;
+      const queryKey = `${email}|${phone}|${name}`;
+      
+      // Avoid duplicate queries
+      if (processedQueries.has(queryKey)) continue;
+      processedQueries.add(queryKey);
+
+      const matchStages = [];
+      
+      if (email && email.trim()) {
+        const cleanEmail = email.toLowerCase().trim();
+        matchStages.push({ borrowerEmail: { $regex: `^${escapeRegex(cleanEmail)}$`, $options: 'i' } });
+      }
+
+      if (phone && phone.trim()) {
+        const cleanPhone = normalizePhone(phone.trim());
+        if (cleanPhone) {
+          matchStages.push({ 
+            $expr: { 
+              $eq: [
+                { $replaceAll: { input: { $replaceAll: { input: '$borrowerMobile', find: ' ', replacement: '' } }, find: '-', replacement: '' } },
+                cleanPhone
+              ]
+            }
+          });
+        }
+      }
+
+      if (name && name.trim()) {
+        const cleanName = name.trim();
+        matchStages.push({ fullName: { $regex: escapeRegex(cleanName), $options: 'i' } });
+      }
+
+      if (matchStages.length > 0) {
+        const pipeline = [
+          { $match: { $or: matchStages } },
+          { $limit: Math.min(limit, 20) }
+        ];
+
+        const results = await Loan.aggregate(pipeline).exec();
+        allLoans.push(...results.map(normalizeLoanForClient));
+      }
+    }
+
+    // Remove duplicates based on loan ID
+    const uniqueLoans = Array.from(new Map(allLoans.map(loan => [loan.id, loan])).values());
+
+    return res.json({
+      success: true,
+      count: uniqueLoans.length,
+      loans: uniqueLoans,
+      queryCount: processedQueries.size
+    });
+  } catch (err) {
+    console.error('POST /api/loans/bulk-query error', err);
+    return res.status(500).json({ 
+      success: false, 
+      error: 'Internal Server Error',
+      message: err.message 
+    });
   }
 });
 
