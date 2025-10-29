@@ -1,6 +1,7 @@
 // routes/loans.js
 const express = require('express');
 const router = express.Router();
+const mongoose = require('mongoose');
 const Loan = require('../models/Loan');
 
 function escapeRegex(s = '') {
@@ -8,11 +9,8 @@ function escapeRegex(s = '') {
 }
 
 function normalizeLoanForClient(raw) {
-  // safe getters
   const get = (k) => raw[k];
-  // convert ObjectId -> string
-  const id = raw._id ? String(raw._id) : (raw.id ? String(raw.id) : '');
-  // helper to coerce numbers
+  const id = raw && (raw._id ? String(raw._id) : (raw.id ? String(raw.id) : '')) || '';
   const num = (v) => {
     if (v == null) return 0;
     if (typeof v === 'number') return v;
@@ -21,7 +19,6 @@ function normalizeLoanForClient(raw) {
       const n = Number(cleaned);
       return Number.isNaN(n) ? 0 : n;
     }
-    // handle nested mongo shapes like { $numberInt: "10" } or { $numberLong: "123" }
     if (typeof v === 'object') {
       for (const val of Object.values(v)) {
         if (typeof val === 'string') {
@@ -36,19 +33,14 @@ function normalizeLoanForClient(raw) {
   };
   const dateToIso = (x) => {
     if (!x) return null;
-    // Date instance
     if (x instanceof Date && !isNaN(x.getTime())) return x.toISOString();
-    // number (ms)
     if (typeof x === 'number') return new Date(x).toISOString();
-    // string
     if (typeof x === 'string') {
       const d = new Date(x);
       if (!isNaN(d.getTime())) return d.toISOString();
-      return x; // leave string (maybe already ISO-like)
+      return x;
     }
-    // nested mongo date shapes
     if (typeof x === 'object') {
-      // { $date: "..." } or { $date: { $numberLong: "..." } }
       if (x.$date) {
         if (typeof x.$date === 'string') return new Date(x.$date).toISOString();
         if (typeof x.$date === 'object' && x.$date.$numberLong) {
@@ -56,7 +48,6 @@ function normalizeLoanForClient(raw) {
           if (!Number.isNaN(ms)) return new Date(ms).toISOString();
         }
       }
-      // try to find any number-like child
       for (const v of Object.values(x)) {
         const maybe = dateToIso(v);
         if (maybe) return maybe;
@@ -66,8 +57,8 @@ function normalizeLoanForClient(raw) {
   };
 
   return {
-    _id: id, // keep _id but as string (your Dart accepts either _id.{ $oid } or id or _id string)
-    id,     // help frontends that look for `id` top-level
+    _id: id,
+    id,
     fullName: (get('fullName') || get('full_name') || '').toString(),
     borrowerMobile: (get('borrowerMobile') || get('borrower_mobile') || get('mobile') || get('phone') || '') || null,
     borrowerLandline: (get('borrowerLandline') || get('borrower_landline') || '') || null,
@@ -85,8 +76,6 @@ function normalizeLoanForClient(raw) {
     importedAt: dateToIso(get('importedAt') || get('imported_at') || get('createdAt') || null),
     createdAt: dateToIso(get('createdAt') || get('created_at') || null),
     updatedAt: dateToIso(get('updatedAt') || get('updated_at') || null),
-    // include any other fields raw if you want to debug (optional)
-    // raw: raw
   };
 }
 
@@ -121,12 +110,37 @@ router.get('/', async (req, res) => {
     }
 
     const filter = or.length ? { $or: or } : {};
-    // fetch as lean (POJOs)
     const raws = await Loan.find(filter).limit(qLimit).lean().exec();
     const loans = raws.map(normalizeLoanForClient);
     return res.json({ success: true, count: loans.length, loans });
   } catch (err) {
     console.error('GET /api/loans error', err);
+    return res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
+});
+
+// GET /api/loans/:id  -> single loan
+router.get('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ success: false, error: 'id required' });
+
+    // Try ObjectId lookup first
+    let doc = null;
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      doc = await Loan.findById(id).lean().exec();
+    }
+    if (!doc) {
+      // fallback: find by id string, branchId or other identifying fields
+      doc = await Loan.findOne({ $or: [{ _id: id }, { id: id }, { branchId: id }, { borrowerMobile: id }] }).lean().exec();
+    }
+
+    if (!doc) return res.status(404).json({ success: false, error: 'Loan not found' });
+
+    const normalized = normalizeLoanForClient(doc);
+    return res.json({ success: true, loan: normalized });
+  } catch (err) {
+    console.error('GET /api/loans/:id error', err);
     return res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
 });
