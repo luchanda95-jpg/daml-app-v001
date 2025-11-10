@@ -104,6 +104,10 @@ UserSchema.methods.verifyPassword = async function (plain) {
 
 const User = mongoose.model('User', UserSchema);
 
+const agreementsRouter = require('./routes/agreements')(authMiddleware);
+app.use('/api/agreements', agreementsRouter);
+
+
 // ---------- AdminSubmission model ----------
 const AdminSubmissionSchema = new Schema({
   from: { type: String, default: 'unknown' },
