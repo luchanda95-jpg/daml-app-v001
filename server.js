@@ -18,18 +18,19 @@ const compression = require("compression");
 const rateLimit = require("express-rate-limit");
 const morgan = require("morgan");
 const bcrypt = require("bcrypt");
-const jwt = require("jsonwebtoken");
 
-const app = express();
-const SALT_ROUNDS = 10;
+const { authMiddleware, requireRole, generateToken } = require("./middleware/auth");
 
 // ============================================================
 // 1) CONFIG
 // ============================================================
+const app = express();
+
 const mongoUri = process.env.MONGO_URI;
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
+
+const SALT_ROUNDS = Number(process.env.SALT_ROUNDS || 10);
+
 const OVERALL_ADMIN_EMAIL = (process.env.OVERALL_ADMIN_EMAIL || "directaccessmoney@gmail.com")
   .toLowerCase()
   .trim();
@@ -39,18 +40,40 @@ if (!mongoUri) {
   process.exit(1);
 }
 
+// If behind a proxy (Render/Heroku/Nginx), helps rate-limit & IP
+app.set("trust proxy", 1);
+
 // ============================================================
 // 2) GLOBAL MIDDLEWARES
 // ============================================================
 app.use(helmet());
 app.use(compression());
 app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
 app.use(morgan("combined"));
 
 // CORS: permissive in dev, restrict in prod via env var
+function parseCorsOrigins(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v;
+  const s = String(v).trim();
+  if (!s) return [];
+  // allow JSON array in env
+  if (s.startsWith("[") && s.endsWith("]")) {
+    try {
+      const arr = JSON.parse(s);
+      if (Array.isArray(arr)) return arr;
+    } catch (_) {}
+  }
+  // comma-separated
+  return s.split(",").map((x) => x.trim()).filter(Boolean);
+}
+
 const corsOptions = {
-  origin: process.env.NODE_ENV === "production" ? process.env.CORS_ORIGIN || [] : true,
+  origin: process.env.NODE_ENV === "production" ? parseCorsOrigins(process.env.CORS_ORIGIN) : true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
 };
 app.use(cors(corsOptions));
 
@@ -64,100 +87,18 @@ const limiter = rateLimit({
 app.use(limiter);
 
 // ============================================================
-// 3) MONGOOSE MODELS (kept in server.js for back-compat)
-//    You can later move these into /models/*.js
+// 3) SAFE MODEL REGISTRATION HELPERS
 // ============================================================
 const { Schema } = mongoose;
 
-// -------------------- User sub-schemas -----------------------
-const NotificationSchema = new Schema(
-  {
-    id: { type: String, required: true },
-    title: String,
-    message: String,
-    type: { type: String, enum: ["info", "success", "warning", "error"], default: "info" },
-    ts: { type: Date, default: () => new Date() },
-  },
-  { _id: false }
-);
+function getOrCreateModel(name, schema) {
+  if (mongoose.models && mongoose.models[name]) return mongoose.models[name];
+  return mongoose.model(name, schema);
+}
 
-const NextPaymentSchema = new Schema(
-  {
-    amount: { type: Number },
-    date: { type: Date },
-  },
-  { _id: false }
-);
-
-const BalancesSchema = new Schema(
-  {
-    amountBorrowed: { type: Number, default: 0 },
-    amountPaid: { type: Number, default: 0 },
-    actualBalance: { type: Number, default: 0 },
-    interestRate: { type: Number, default: 0 },
-    next_payment: { type: NextPaymentSchema, default: null },
-  },
-  { _id: false }
-);
-
-// -------------------- User model -----------------------------
-const UserSchema = new Schema(
-  {
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
-    passwordHash: { type: String, required: true },
-    name: { type: String, default: "" },
-    phone: { type: String, default: "" },
-    role: { type: String, enum: ["client", "branch_admin", "ovadmin"], default: "client", index: true },
-    balances: { type: BalancesSchema, default: () => ({}) },
-    notifications: { type: [NotificationSchema], default: [] },
-    createdAt: { type: Date, default: () => new Date() },
-    updatedAt: { type: Date, default: () => new Date() },
-  },
-  { timestamps: true }
-);
-
-UserSchema.pre("save", function (next) {
-  this.email = (this.email || "").toLowerCase().trim();
-  this.updatedAt = new Date();
-  next();
-});
-
-UserSchema.methods.setPassword = async function (plain) {
-  this.passwordHash = await bcrypt.hash(plain, SALT_ROUNDS);
-  return this;
-};
-
-UserSchema.methods.verifyPassword = async function (plain) {
-  if (!this.passwordHash) return false;
-  return bcrypt.compare(plain, this.passwordHash);
-};
-
-const User = mongoose.model("User", UserSchema);
-
-// -------------------- AdminSubmission model ------------------
-const AdminSubmissionSchema = new Schema(
-  {
-    from: { type: String, default: "unknown" },
-    ts: { type: Date, default: () => new Date() },
-    data: { type: Schema.Types.Mixed, default: {} },
-  },
-  { timestamps: true }
-);
-const AdminSubmission = mongoose.model("AdminSubmission", AdminSubmissionSchema);
-
-// -------------------- BranchComment model --------------------
-const BranchCommentSchema = new Schema({
-  branchName: String,
-  comments: [
-    {
-      author: String,
-      comment: String,
-      timestamp: Date,
-    },
-  ],
-  updatedAt: { type: Date, default: Date.now },
-});
-const BranchComment = mongoose.model("BranchComment", BranchCommentSchema);
+// Canonical User model (from /models/User.js)
+// IMPORTANT: server.js should NOT redefine User schema again.
+const User = require("./models/User");
 
 // ============================================================
 // 4) DATE NORMALIZERS + SANITIZERS (used in reports)
@@ -211,9 +152,38 @@ function toNumber(v) {
   return 0;
 }
 
+function normalizePhone(p) {
+  return String(p || "").replace(/[^\d]/g, "");
+}
+
 // ============================================================
-// 5) REPORT MODELS (Daily / Monthly / Zanaco)
+// 5) REPORT MODELS (Daily / Monthly / Zanaco) + ADMIN MODELS
 // ============================================================
+
+// -------------------- AdminSubmission model ------------------
+const AdminSubmissionSchema = new Schema(
+  {
+    from: { type: String, default: "unknown" },
+    ts: { type: Date, default: () => new Date() },
+    data: { type: Schema.Types.Mixed, default: {} },
+  },
+  { timestamps: true }
+);
+const AdminSubmission = getOrCreateModel("AdminSubmission", AdminSubmissionSchema);
+
+// -------------------- BranchComment model --------------------
+const BranchCommentSchema = new Schema({
+  branchName: String,
+  comments: [
+    {
+      author: String,
+      comment: String,
+      timestamp: Date,
+    },
+  ],
+  updatedAt: { type: Date, default: Date.now },
+});
+const BranchComment = getOrCreateModel("BranchComment", BranchCommentSchema);
 
 // -------------------- DailyReport model ----------------------
 const DailyReportSchema = new Schema(
@@ -234,7 +204,7 @@ const DailyReportSchema = new Schema(
   { timestamps: true }
 );
 DailyReportSchema.index({ branch: 1, date: 1 }, { unique: true });
-const DailyReport = mongoose.model("DailyReport", DailyReportSchema);
+const DailyReport = getOrCreateModel("DailyReport", DailyReportSchema);
 
 // -------------------- ZanacoDistribution model ----------------
 const ZanacoDistributionSchema = new Schema(
@@ -258,13 +228,7 @@ ZanacoDistributionSchema.pre("validate", function (next) {
   next();
 });
 
-ZanacoDistributionSchema.method("toJSON", function () {
-  const obj = this.toObject({ getters: true, virtuals: false });
-  if (obj.date) obj.date = new Date(obj.date).toISOString();
-  return obj;
-});
-
-const ZanacoDistribution = mongoose.model("ZanacoDistribution", ZanacoDistributionSchema);
+const ZanacoDistribution = getOrCreateModel("ZanacoDistribution", ZanacoDistributionSchema);
 
 // -------------------- MonthlyReport model ---------------------
 const MonthlyReportSchema = new Schema(
@@ -314,7 +278,7 @@ MonthlyReportSchema.pre("save", function (next) {
     const normalized = normalizeToUtcMonthStart(this.date);
     if (normalized) this.date = normalized;
   }
-  this.updatedAt = this.updatedAt ? new Date(this.updatedAt) : new Date();
+  this.updatedAt = new Date();
   if (!this.createdAt) this.createdAt = new Date();
   next();
 });
@@ -332,221 +296,344 @@ MonthlyReportSchema.pre("findOneAndUpdate", function (next) {
   next();
 });
 
-MonthlyReportSchema.method("toJSON", function () {
-  const obj = this.toObject({ getters: true, virtuals: false });
-  if (obj.date) obj.date = new Date(obj.date).toISOString();
-  if (obj.updatedAt) obj.updatedAt = new Date(obj.updatedAt).toISOString();
-  if (obj.createdAt) obj.createdAt = new Date(obj.createdAt).toISOString();
-  return obj;
-});
-
-const MonthlyReport = mongoose.model("MonthlyReport", MonthlyReportSchema);
+const MonthlyReport = getOrCreateModel("MonthlyReport", MonthlyReportSchema);
 
 // ============================================================
-// 6) AUTH MIDDLEWARE (JWT)
-//    NOTE: you ALSO have middleware/auth.js in your project.
-//    Keeping this here for back-compat with your current server.js.
-// ============================================================
-async function authMiddleware(req, res, next) {
-  const auth = req.headers["authorization"];
-  if (!auth || !auth.startsWith("Bearer ")) {
-    return res.status(401).json({ success: false, error: "Missing Authorization header" });
-  }
-  const token = auth.slice(7);
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
-
-    // Optional: load full user in req.currentUser
-    try {
-      const user = await User.findOne({ email: String(payload.email || "").toLowerCase().trim() });
-      if (user) req.currentUser = user;
-    } catch (_) {}
-
-    next();
-  } catch (err) {
-    return res.status(401).json({ success: false, error: "Invalid token" });
-  }
-}
-
-// ============================================================
-// 7) AGREEMENTS ROUTER (if you have it)
+// 6) AGREEMENTS ROUTER (optional)
 // ============================================================
 try {
-  const agreementsRouter = require("./routes/agreements")(authMiddleware);
-  app.use("/api/agreements", agreementsRouter);
-} catch (e) {
-  console.log("ℹ️ agreements router not mounted (missing ./routes/agreements).");
-}
-
-// ============================================================
-// 8) CLIENTS ROUTER (FETCH CLIENT DATA FOR LOGGED-IN USER)
-//    Supports two export styles:
-//      A) module.exports = router
-//      B) module.exports = (authMiddleware) => router
-// ============================================================
-try {
-  const clientsModule = require("./routes/clients");
-  if (typeof clientsModule === "function") {
-    // If your routes/clients.js was written as (authMiddleware) => router
-    app.use("/api/clients", clientsModule(authMiddleware));
+  const agreementsFactory = require("./routes/agreements");
+  if (typeof agreementsFactory === "function") {
+    app.use("/api/agreements", agreementsFactory(authMiddleware));
   } else {
-    // If your routes/clients.js exports an express.Router()
-    app.use("/api/clients", authMiddleware, clientsModule);
+    app.use("/api/agreements", authMiddleware, agreementsFactory);
   }
-  console.log("✅ /api/clients mounted");
+  console.log("✅ /api/agreements mounted");
 } catch (e) {
-  console.log("ℹ️ clients router not mounted (missing ./routes/clients).");
+  console.log("ℹ️ agreements router not mounted:", e.message);
 }
 
 // ============================================================
-// 9) AUTH ROUTER (INLINE REGISTER + LOGIN)
-//    If you already use routes/auth.js, you can replace this block.
+// 7) AUTH ROUTER (REGISTER + LOGIN)
 // ============================================================
 const authRouter = express.Router();
 
-function makeTokenFor(user) {
-  const payload = { email: user.email, role: user.role };
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
-}
-
-function normalizePhone(p) {
-  return String(p || "").replace(/[^\d]/g, "");
-}
-
+// POST /api/auth/register
 authRouter.post("/register", async (req, res) => {
   try {
     const { name, email, phone, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ success: false, error: "email and password required" });
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: "email and password required" });
+    }
 
-    const normalized = String(email).toLowerCase().trim();
-    const existing = await User.findOne({ email: normalized });
+    const normalizedEmail = String(email).toLowerCase().trim();
+    const normalizedPhone = normalizePhone(phone);
+
+    const existing = await User.findOne({ email: normalizedEmail }).lean();
     if (existing) return res.status(409).json({ success: false, error: "Email already registered" });
 
-    const user = new User({
-      email: normalized,
+    const passwordHash = await bcrypt.hash(String(password), SALT_ROUNDS);
+
+    const user = await User.create({
+      email: normalizedEmail,
       name: name || "",
-      phone: normalizePhone(phone), // ✅ helps match Client.phone from CSV
+      phone: normalizedPhone,
       role: "client",
+      passwordHash,
+      balances: {},
+      notifications: [],
     });
 
-    await user.setPassword(password);
-    await user.save();
+    const token = generateToken({
+      email: user.email,
+      sub: user.email,
+      role: user.role,
+      name: user.name || "",
+      phone: user.phone || "",
+    });
 
-    const token = makeTokenFor(user);
-    return res.status(201).json({ token, role: user.role, name: user.name, phone: user.phone });
+    return res.status(201).json({
+      token,
+      email: user.email,
+      role: user.role,
+      name: user.name,
+      phone: user.phone,
+    });
   } catch (err) {
-    console.error("POST /auth/register error:", err);
+    console.error("POST /api/auth/register error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
 
+// POST /api/auth/login
 authRouter.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ success: false, error: "email and password required" });
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: "email and password required" });
+    }
 
-    const normalized = String(email).toLowerCase().trim();
-    const user = await User.findOne({ email: normalized });
+    const normalizedEmail = String(email).toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail }).lean();
     if (!user) return res.status(401).json({ success: false, error: "Invalid credentials" });
 
-    const ok = await user.verifyPassword(password);
+    const ok = await bcrypt.compare(String(password), String(user.passwordHash || ""));
     if (!ok) return res.status(401).json({ success: false, error: "Invalid credentials" });
 
-    const token = makeTokenFor(user);
-    return res.json({ token, role: user.role, name: user.name, phone: user.phone });
+    const token = generateToken({
+      email: user.email,
+      sub: user.email,
+      role: user.role,
+      name: user.name || "",
+      phone: user.phone || "",
+    });
+
+    return res.json({
+      token,
+      email: user.email,
+      role: user.role,
+      name: user.name || "",
+      phone: user.phone || "",
+    });
   } catch (err) {
-    console.error("POST /auth/login error:", err);
+    console.error("POST /api/auth/login error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
 
 // ============================================================
-// 10) USERS ROUTER (balances + notifications)
+// 8) USERS ROUTER (list + profile + balances + notifications)
 // ============================================================
 const usersRouter = express.Router();
 
-usersRouter.get("/:email/balances", authMiddleware, async (req, res) => {
+// GET /api/users (ovadmin only) - minimal list
+usersRouter.get("/", authMiddleware, requireRole("ovadmin"), async (req, res) => {
   try {
-    const email = req.params.email.toLowerCase().trim();
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ success: false, error: "User not found" });
-    return res.json(Object.assign({}, user.balances ? user.balances.toObject() : {}));
+    const items = await User.find()
+      .select("email name phone role createdAt updatedAt")
+      .sort({ createdAt: -1 })
+      .lean();
+    return res.json(items);
   } catch (err) {
-    console.error("GET /users/:email/balances error:", err);
+    console.error("GET /api/users error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
 
-usersRouter.post("/:email/balances", authMiddleware, async (req, res) => {
+// GET /api/users/:email/profile
+usersRouter.get("/:email/profile", authMiddleware, async (req, res) => {
   try {
-    const email = req.params.email.toLowerCase().trim();
-    const payload = req.body || {};
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ success: false, error: "User not found" });
+    const target = String(req.params.email || "").toLowerCase().trim();
+    if (!target) return res.status(400).json({ success: false, error: "email required" });
 
-    function toNum(v) {
-      if (v == null) return 0;
-      if (typeof v === "number") return v;
-      const n = Number(v);
-      return Number.isNaN(n) ? 0 : n;
+    // self or admin
+    const isSelf = String(req.user?.email || "").toLowerCase().trim() === target;
+    const isAdmin = ["ovadmin", "branch_admin"].includes(req.user?.role);
+    if (!isSelf && !isAdmin) return res.status(403).json({ success: false, error: "Forbidden" });
+
+    const u = await User.findOne({ email: target }).lean();
+    if (!u) return res.status(404).json({ success: false, error: "User not found" });
+
+    const notificationsCount = Array.isArray(u.notifications) ? u.notifications.length : 0;
+
+    return res.json({
+      email: u.email,
+      name: u.name || "",
+      phone: u.phone || "",
+      role: u.role || "client",
+      balances: u.balances || {},
+      notificationsCount,
+    });
+  } catch (err) {
+    console.error("GET /api/users/:email/profile error:", err);
+    return res.status(500).json({ success: false, error: err.message || "Internal server error" });
+  }
+});
+
+// PUT /api/users/:email/profile
+usersRouter.put("/:email/profile", authMiddleware, async (req, res) => {
+  try {
+    const target = String(req.params.email || "").toLowerCase().trim();
+    if (!target) return res.status(400).json({ success: false, error: "email required" });
+
+    const isSelf = String(req.user?.email || "").toLowerCase().trim() === target;
+    const isOvAdmin = req.user?.role === "ovadmin";
+    if (!isSelf && !isOvAdmin) return res.status(403).json({ success: false, error: "Forbidden" });
+
+    const body = req.body || {};
+    const update = {};
+
+    if (body.name != null) update.name = String(body.name);
+    if (body.phone != null) update.phone = normalizePhone(body.phone);
+
+    // role change only by ovadmin
+    if (body.role != null) {
+      if (!isOvAdmin) return res.status(403).json({ success: false, error: "Forbidden" });
+      const r = String(body.role);
+      if (!["client", "branch_admin", "ovadmin"].includes(r)) {
+        return res.status(400).json({ success: false, error: "Invalid role" });
+      }
+      update.role = r;
     }
 
-    user.balances = user.balances || {};
-    user.balances.amountBorrowed = toNum(payload.amountBorrowed ?? payload.amount_borrowed ?? user.balances.amountBorrowed);
-    user.balances.amountPaid = toNum(payload.amountPaid ?? payload.amount_paid ?? user.balances.amountPaid);
-    user.balances.actualBalance = toNum(payload.actualBalance ?? payload.actual_balance ?? user.balances.actualBalance);
-    user.balances.interestRate = toNum(payload.interestRate ?? payload.interest_rate ?? user.balances.interestRate);
+    const u = await User.findOneAndUpdate(
+      { email: target },
+      { $set: update },
+      { new: true }
+    ).lean();
+
+    if (!u) return res.status(404).json({ success: false, error: "User not found" });
+
+    return res.json({
+      success: true,
+      profile: {
+        email: u.email,
+        name: u.name || "",
+        phone: u.phone || "",
+        role: u.role || "client",
+        balances: u.balances || {},
+      },
+    });
+  } catch (err) {
+    console.error("PUT /api/users/:email/profile error:", err);
+    return res.status(500).json({ success: false, error: err.message || "Internal server error" });
+  }
+});
+
+// GET /api/users/:email/next_payment
+usersRouter.get("/:email/next_payment", authMiddleware, async (req, res) => {
+  try {
+    const target = String(req.params.email || "").toLowerCase().trim();
+    if (!target) return res.status(400).json({ success: false, error: "email required" });
+
+    const isSelf = String(req.user?.email || "").toLowerCase().trim() === target;
+    const isAdmin = ["ovadmin", "branch_admin"].includes(req.user?.role);
+    if (!isSelf && !isAdmin) return res.status(403).json({ success: false, error: "Forbidden" });
+
+    const u = await User.findOne({ email: target }).lean();
+    if (!u) return res.status(404).json({ success: false, error: "User not found" });
+
+    const np = u?.balances?.next_payment || null;
+    return res.json({ next_payment: np });
+  } catch (err) {
+    console.error("GET /api/users/:email/next_payment error:", err);
+    return res.status(500).json({ success: false, error: err.message || "Internal server error" });
+  }
+});
+
+// GET /api/users/:email/balances
+usersRouter.get("/:email/balances", authMiddleware, async (req, res) => {
+  try {
+    const email = String(req.params.email || "").toLowerCase().trim();
+    const isSelf = String(req.user?.email || "").toLowerCase().trim() === email;
+    const isAdmin = ["ovadmin", "branch_admin"].includes(req.user?.role);
+    if (!isSelf && !isAdmin) return res.status(403).json({ success: false, error: "Forbidden" });
+
+    const user = await User.findOne({ email }).lean();
+    if (!user) return res.status(404).json({ success: false, error: "User not found" });
+    return res.json(Object.assign({}, user.balances || {}));
+  } catch (err) {
+    console.error("GET /api/users/:email/balances error:", err);
+    return res.status(500).json({ success: false, error: err.message || "Internal server error" });
+  }
+});
+
+// POST /api/users/:email/balances
+usersRouter.post("/:email/balances", authMiddleware, async (req, res) => {
+  try {
+    const email = String(req.params.email || "").toLowerCase().trim();
+    const isSelf = String(req.user?.email || "").toLowerCase().trim() === email;
+    const isAdmin = ["ovadmin", "branch_admin"].includes(req.user?.role);
+    if (!isSelf && !isAdmin) return res.status(403).json({ success: false, error: "Forbidden" });
+
+    const payload = req.body || {};
+
+    const update = {};
+    const setBalances = {};
+
+    const pickNum = (v) => {
+      if (v == null) return undefined;
+      const n = Number(v);
+      return Number.isNaN(n) ? undefined : n;
+    };
+
+    const amountBorrowed = pickNum(payload.amountBorrowed ?? payload.amount_borrowed);
+    const amountPaid = pickNum(payload.amountPaid ?? payload.amount_paid);
+    const actualBalance = pickNum(payload.actualBalance ?? payload.actual_balance);
+    const interestRate = pickNum(payload.interestRate ?? payload.interest_rate);
+
+    if (amountBorrowed != null) setBalances["balances.amountBorrowed"] = amountBorrowed;
+    if (amountPaid != null) setBalances["balances.amountPaid"] = amountPaid;
+    if (actualBalance != null) setBalances["balances.actualBalance"] = actualBalance;
+    if (interestRate != null) setBalances["balances.interestRate"] = interestRate;
 
     if (payload.next_payment && typeof payload.next_payment === "object") {
       const np = {};
-      if (payload.next_payment.amount != null) np.amount = toNum(payload.next_payment.amount);
+      if (payload.next_payment.amount != null) {
+        const a = pickNum(payload.next_payment.amount);
+        if (a != null) np.amount = a;
+      }
       if (payload.next_payment.date) {
         const d = new Date(payload.next_payment.date);
         if (!isNaN(d.getTime())) np.date = d;
       }
-      user.balances.next_payment = Object.keys(np).length ? np : user.balances.next_payment;
+      if (Object.keys(np).length) setBalances["balances.next_payment"] = np;
     }
 
-    await user.save();
-    return res.json({ success: true, message: "Balances updated" });
+    update.$set = Object.assign({}, setBalances);
+
+    const user = await User.findOneAndUpdate({ email }, update, { new: true }).lean();
+    if (!user) return res.status(404).json({ success: false, error: "User not found" });
+
+    return res.json({ success: true, message: "Balances updated", balances: user.balances || {} });
   } catch (err) {
-    console.error("POST /users/:email/balances error:", err);
+    console.error("POST /api/users/:email/balances error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
 
+// POST /api/users/:email/notifications
 usersRouter.post("/:email/notifications", authMiddleware, async (req, res) => {
   try {
-    const email = req.params.email.toLowerCase().trim();
+    const email = String(req.params.email || "").toLowerCase().trim();
+    const isSelf = String(req.user?.email || "").toLowerCase().trim() === email;
+    const isAdmin = ["ovadmin", "branch_admin"].includes(req.user?.role);
+    if (!isSelf && !isAdmin) return res.status(403).json({ success: false, error: "Forbidden" });
+
     const { title, message, type } = req.body || {};
     if (!title || !message) return res.status(400).json({ success: false, error: "title and message are required" });
 
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ success: false, error: "User not found" });
-
     const n = {
-      id: String(Date.now()),
-      title,
-      message,
+      title: String(title),
+      message: String(message),
       type: ["info", "success", "warning", "error"].includes(type) ? type : "info",
       ts: new Date(),
     };
 
-    user.notifications = user.notifications || [];
-    user.notifications.unshift(n);
-    if (user.notifications.length > 200) user.notifications = user.notifications.slice(0, 200);
-    await user.save();
+    const user = await User.findOneAndUpdate(
+      { email },
+      {
+        $push: { notifications: { $each: [n], $position: 0 } },
+      },
+      { new: true }
+    ).lean();
+
+    if (!user) return res.status(404).json({ success: false, error: "User not found" });
+
+    // cap notifications (server-side cap)
+    if (Array.isArray(user.notifications) && user.notifications.length > 200) {
+      await User.updateOne({ email }, { $set: { notifications: user.notifications.slice(0, 200) } });
+    }
 
     return res.status(201).json({ success: true, message: "Notification added", notification: n });
   } catch (err) {
-    console.error("POST /users/:email/notifications error:", err);
+    console.error("POST /api/users/:email/notifications error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
 
 // ============================================================
-// 11) ADMIN ROUTER (submissions + notify overall admin)
+// 9) ADMIN ROUTER (submissions + notify overall admin)
 // ============================================================
 const adminRouter = express.Router();
 
@@ -559,50 +646,53 @@ adminRouter.post("/submissions", authMiddleware, async (req, res) => {
     const sub = new AdminSubmission({ from, ts: now, data: body });
     await sub.save();
 
-    const adminUser = await User.findOne({ email: OVERALL_ADMIN_EMAIL });
+    // notify overall admin (if exists)
+    const adminUser = await User.findOne({ email: OVERALL_ADMIN_EMAIL }).lean();
     if (adminUser) {
-      adminUser.notifications = adminUser.notifications || [];
-      adminUser.notifications.unshift({
-        id: String(Date.now()),
+      const note = {
         title: "New client submission",
         message: `Submission from ${from}`,
         type: "info",
         ts: now,
-      });
-      await adminUser.save();
+      };
+
+      await User.updateOne(
+        { email: OVERALL_ADMIN_EMAIL },
+        { $push: { notifications: { $each: [note], $position: 0 } } }
+      );
     }
 
     return res.status(201).json({ success: true, message: "Submission saved", id: sub._id.toString() });
   } catch (err) {
-    console.error("POST /admin/submissions error:", err);
+    console.error("POST /api/admin/submissions error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
 
-adminRouter.get("/submissions", authMiddleware, async (req, res) => {
+adminRouter.get("/submissions", authMiddleware, requireRole("ovadmin", "branch_admin"), async (req, res) => {
   try {
-    const items = await AdminSubmission.find().sort({ ts: -1 });
+    const items = await AdminSubmission.find().sort({ ts: -1 }).lean();
     return res.json(items);
   } catch (err) {
-    console.error("GET /admin/submissions error:", err);
+    console.error("GET /api/admin/submissions error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
 
-adminRouter.delete("/submissions/:id", authMiddleware, async (req, res) => {
+adminRouter.delete("/submissions/:id", authMiddleware, requireRole("ovadmin"), async (req, res) => {
   try {
     const id = req.params.id;
-    const deleted = await AdminSubmission.findByIdAndDelete(id);
+    const deleted = await AdminSubmission.findByIdAndDelete(id).lean();
     if (!deleted) return res.status(404).json({ success: false, error: "Not found" });
-    return res.json({ success: true, message: "Submission deleted", deletedId: deleted._id.toString() });
+    return res.json({ success: true, message: "Submission deleted", deletedId: String(deleted._id) });
   } catch (err) {
-    console.error("DELETE /admin/submissions/:id error:", err);
+    console.error("DELETE /api/admin/submissions/:id error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
 
 // ============================================================
-// 12) REPORTS ROUTER (Zanaco + Daily + Monthly)
+// 10) REPORTS ROUTER (Zanaco + Daily + Monthly)
 // ============================================================
 const reportsRouter = express.Router();
 
@@ -622,7 +712,7 @@ reportsRouter.get("/zanaco/distributions", async (req, res) => {
     const docs = await ZanacoDistribution.find(q).lean();
     return res.json({ success: true, distributions: docs });
   } catch (err) {
-    console.error("GET /zanaco/distributions error:", err);
+    console.error("GET /api/zanaco/distributions error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
@@ -644,7 +734,7 @@ reportsRouter.get("/zanaco", async (req, res) => {
 
     return res.json({ success: true, distributions: docs });
   } catch (err) {
-    console.error("GET /zanaco error:", err);
+    console.error("GET /api/zanaco error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
@@ -674,11 +764,11 @@ reportsRouter.post("/zanaco", async (req, res) => {
       upsert: true,
       new: true,
       setDefaultsOnInsert: true,
-    });
+    }).lean();
 
     return res.json({ success: true, distribution: doc });
   } catch (err) {
-    console.error("POST /zanaco error:", err);
+    console.error("POST /api/zanaco error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
@@ -739,7 +829,7 @@ reportsRouter.post("/zanaco/bulk", async (req, res) => {
         : undefined,
     });
   } catch (err) {
-    console.error("POST /zanaco/bulk error:", err);
+    console.error("POST /api/zanaco/bulk error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
@@ -856,17 +946,17 @@ reportsRouter.post("/sync_reports", async (req, res) => {
         : undefined,
     });
   } catch (err) {
-    console.error("POST /sync_reports catastrophic error:", err);
+    console.error("POST /api/sync_reports catastrophic error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
 
 reportsRouter.get("/reports", async (req, res) => {
   try {
-    const reports = await DailyReport.find().sort({ date: -1 });
+    const reports = await DailyReport.find().sort({ date: -1 }).lean();
     return res.json(reports);
   } catch (err) {
-    console.error("GET /reports error:", err);
+    console.error("GET /api/reports error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
@@ -882,7 +972,7 @@ reportsRouter.get("/reports/query", async (req, res) => {
     const doc = await DailyReport.findOne({ branch: String(branch).trim(), date: norm }).lean();
     return res.json({ success: true, report: doc });
   } catch (err) {
-    console.error("GET /reports/query error:", err);
+    console.error("GET /api/reports/query error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
@@ -918,11 +1008,11 @@ reportsRouter.post("/report", async (req, res) => {
       { branch, date: dateNorm },
       { $set: updateData, $setOnInsert: { createdAt: new Date() } },
       { upsert: true, new: true }
-    );
+    ).lean();
 
     return res.json({ success: true, report: doc });
   } catch (err) {
-    console.error("POST /report error:", err);
+    console.error("POST /api/report error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
@@ -939,12 +1029,12 @@ reportsRouter.delete("/reports", async (req, res) => {
     const endOfDay = new Date(startOfDay);
     endOfDay.setUTCDate(endOfDay.getUTCDate() + 1);
 
-    const deleted = await DailyReport.findOneAndDelete({ branch, date: { $gte: startOfDay, $lt: endOfDay } });
+    const deleted = await DailyReport.findOneAndDelete({ branch, date: { $gte: startOfDay, $lt: endOfDay } }).lean();
     if (!deleted) return res.status(404).json({ success: false, error: "Report not found" });
 
-    return res.json({ success: true, message: "Report deleted", deletedId: deleted._id.toString() });
+    return res.json({ success: true, message: "Report deleted", deletedId: String(deleted._id) });
   } catch (err) {
-    console.error("DELETE /reports error:", err);
+    console.error("DELETE /api/reports error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
@@ -952,12 +1042,12 @@ reportsRouter.delete("/reports", async (req, res) => {
 reportsRouter.delete("/reports/:id", async (req, res) => {
   try {
     const id = req.params.id;
-    const deleted = await DailyReport.findByIdAndDelete(id);
+    const deleted = await DailyReport.findByIdAndDelete(id).lean();
     if (!deleted) return res.status(404).json({ success: false, error: "Not found" });
 
-    return res.json({ success: true, message: "Report deleted", deletedId: deleted._id.toString() });
+    return res.json({ success: true, message: "Report deleted", deletedId: String(deleted._id) });
   } catch (err) {
-    console.error("DELETE /reports/:id error:", err);
+    console.error("DELETE /api/reports/:id error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
@@ -1117,17 +1207,17 @@ reportsRouter.post("/sync_monthly_reports", async (req, res) => {
         : undefined,
     });
   } catch (err) {
-    console.error("POST /sync_monthly_reports catastrophic error:", err);
+    console.error("POST /api/sync_monthly_reports catastrophic error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
 
 reportsRouter.get("/monthly_reports", async (req, res) => {
   try {
-    const reports = await MonthlyReport.find().sort({ date: -1 });
+    const reports = await MonthlyReport.find().sort({ date: -1 }).lean();
     return res.json(reports);
   } catch (err) {
-    console.error("GET /monthly_reports error:", err);
+    console.error("GET /api/monthly_reports error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
@@ -1146,12 +1236,12 @@ reportsRouter.delete("/monthly_reports", async (req, res) => {
     const deleted = await MonthlyReport.findOneAndDelete({
       branch,
       date: { $gte: startOfMonth, $lt: startOfNextMonth },
-    });
+    }).lean();
 
     if (!deleted) return res.status(404).json({ success: false, error: "Monthly report not found" });
-    return res.json({ success: true, message: "Monthly report deleted", deletedId: deleted._id.toString() });
+    return res.json({ success: true, message: "Monthly report deleted", deletedId: String(deleted._id) });
   } catch (err) {
-    console.error("DELETE /monthly_reports error:", err);
+    console.error("DELETE /api/monthly_reports error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
@@ -1159,17 +1249,28 @@ reportsRouter.delete("/monthly_reports", async (req, res) => {
 reportsRouter.delete("/monthly_reports/:id", async (req, res) => {
   try {
     const id = req.params.id;
-    const deleted = await MonthlyReport.findByIdAndDelete(id);
+    const deleted = await MonthlyReport.findByIdAndDelete(id).lean();
     if (!deleted) return res.status(404).json({ success: false, error: "Not found" });
-    return res.json({ success: true, message: "Monthly report deleted", deletedId: deleted._id.toString() });
+    return res.json({ success: true, message: "Monthly report deleted", deletedId: String(deleted._id) });
   } catch (err) {
-    console.error("DELETE /monthly_reports/:id error:", err);
+    console.error("DELETE /api/monthly_reports/:id error:", err);
     return res.status(500).json({ success: false, error: err.message || "Internal server error" });
   }
 });
 
 // ============================================================
-// 13) MOUNT ROUTERS
+// 11) CLIENTS ROUTER (MUST be mounted, show errors if it fails)
+// ============================================================
+try {
+  const clientsRouter = require("./routes/clients");
+  app.use("/api/clients", authMiddleware, clientsRouter);
+  console.log("✅ /api/clients mounted");
+} catch (e) {
+  console.log("❌ clients router failed to mount:", e.message);
+}
+
+// ============================================================
+// 12) MOUNT ROUTERS
 // ============================================================
 app.use("/api/auth", authRouter);
 app.use("/api/users", usersRouter);
@@ -1182,7 +1283,7 @@ try {
   app.use("/api/loans", loansRouter);
   console.log("✅ /api/loans mounted");
 } catch (e) {
-  console.log("ℹ️ loans router not mounted (missing ./routes/loans).");
+  console.log("ℹ️ loans router not mounted:", e.message);
 }
 
 // Imports router
@@ -1191,11 +1292,11 @@ try {
   app.use("/api/imports", importsRouter);
   console.log("✅ /api/imports mounted");
 } catch (e) {
-  console.log("ℹ️ imports router not mounted (missing ./routes/imports).");
+  console.log("ℹ️ imports router not mounted:", e.message);
 }
 
 // ============================================================
-// 14) HEALTH + ROOT
+// 13) HEALTH + ROOT
 // ============================================================
 app.get("/health", (req, res) => {
   res.status(200).json({
@@ -1222,7 +1323,7 @@ app.get("/", (req, res) => {
 });
 
 // ============================================================
-// 15) ERROR HANDLER + 404
+// 14) ERROR HANDLER + 404
 // ============================================================
 app.use((err, req, res, next) => {
   console.error("Server error:", err);
@@ -1238,7 +1339,7 @@ app.use((req, res) => {
 });
 
 // ============================================================
-// 16) CONNECT DB + START SERVER
+// 15) CONNECT DB + START SERVER
 // ============================================================
 mongoose
   .connect(mongoUri, { autoIndex: true })
@@ -1248,13 +1349,14 @@ mongoose
     process.exit(1);
   });
 
-const server = app.listen(PORT, () => {
+// Bind to 0.0.0.0 so phones on LAN can access via PC IP
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 DAML Server running on port ${PORT}`);
   console.log(`🌐 Environment: ${process.env.NODE_ENV || "development"}`);
 });
 
 // ============================================================
-// 17) GRACEFUL SHUTDOWN
+// 16) GRACEFUL SHUTDOWN
 // ============================================================
 const shutdown = async (signal) => {
   console.log(`\nReceived ${signal}. Closing server...`);
@@ -1274,7 +1376,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 // ============================================================
-// 18) SEED DEV ADMINS (optional) -> node server.js --seed
+// 17) SEED DEV ADMINS (optional) -> node server.js --seed
 // ============================================================
 async function seedAdmins() {
   try {
@@ -1291,11 +1393,10 @@ async function seedAdmins() {
 
     const overall = OVERALL_ADMIN_EMAIL;
 
-    const ov = await User.findOne({ email: overall });
+    const ov = await User.findOne({ email: overall }).lean();
     if (!ov) {
-      const u = new User({ email: overall, name: "Overall Admin", role: "ovadmin" });
-      await u.setPassword("ovadmin");
-      await u.save();
+      const passwordHash = await bcrypt.hash("ovadmin", SALT_ROUNDS);
+      await User.create({ email: overall, name: "Overall Admin", role: "ovadmin", passwordHash });
       console.log(`Created overall admin ${overall} / ovadmin`);
     } else {
       console.log(`Overall admin ${overall} already exists`);
@@ -1303,11 +1404,10 @@ async function seedAdmins() {
 
     for (const e of branchEmails) {
       const normalized = e.toLowerCase().trim();
-      const u2 = await User.findOne({ email: normalized });
+      const u2 = await User.findOne({ email: normalized }).lean();
       if (!u2) {
-        const b = new User({ email: normalized, name: "Branch Admin", role: "branch_admin" });
-        await b.setPassword("admin");
-        await b.save();
+        const passwordHash = await bcrypt.hash("admin", SALT_ROUNDS);
+        await User.create({ email: normalized, name: "Branch Admin", role: "branch_admin", passwordHash });
         console.log(`Created branch admin ${normalized} / admin`);
       } else {
         console.log(`Branch admin ${normalized} already exists`);

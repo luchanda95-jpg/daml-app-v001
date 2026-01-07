@@ -1,7 +1,16 @@
 // routes/clients.js
 const express = require("express");
+const mongoose = require("mongoose");
 const Client = require("../models/Client");
-const User = require("../models/User"); // safe import here
+
+function getUserModelSafe() {
+  if (mongoose.models && mongoose.models.User) return mongoose.models.User;
+  try {
+    return mongoose.model("User"); // if already registered elsewhere
+  } catch (_) {
+    return require("../models/User"); // fallback
+  }
+}
 
 function normalizePhone(p) {
   if (!p) return "";
@@ -13,17 +22,14 @@ function phoneVariants(phone) {
   if (!p) return [];
   const set = new Set([p]);
 
-  // add with/without leading 0
   if (p.startsWith("0")) set.add(p.slice(1));
   else set.add("0" + p);
 
-  // add with/without country code 260
   if (p.startsWith("260")) {
     const local = p.slice(3);
     set.add(local);
     if (!local.startsWith("0")) set.add("0" + local);
   } else {
-    // if local 9/10 digits, add 260 variant
     if (p.length <= 10) set.add("260" + (p.startsWith("0") ? p.slice(1) : p));
   }
 
@@ -32,25 +38,25 @@ function phoneVariants(phone) {
 
 const router = express.Router();
 
-// ✅ GET /api/clients/me
+// GET /api/clients/me
 router.get("/me", async (req, res) => {
   try {
-    // req.user set by authMiddleware
     const email = (req.user?.email || "").toLowerCase().trim();
     if (!email) return res.status(401).json({ message: "Unauthorized" });
 
-    // Get full user so we can read phone + name
+    const User = getUserModelSafe();
     const user = await User.findOne({ email }).lean();
+
     const userPhone = user?.phone || "";
-    const userEmail = user?.email || email;
+    const userEmail = (user?.email || email).toLowerCase().trim();
 
     const ors = [];
-    if (userEmail) ors.push({ email: userEmail.toLowerCase().trim() });
+    if (userEmail) ors.push({ email: userEmail });
 
     const variants = phoneVariants(userPhone);
     if (variants.length) ors.push({ phone: { $in: variants } });
 
-    if (ors.length === 0) {
+    if (!ors.length) {
       return res.status(400).json({
         success: false,
         message: "Your account has no email/phone to match client records.",
@@ -65,7 +71,7 @@ router.get("/me", async (req, res) => {
       return res.status(404).json({
         success: false,
         message: "Client not found. Ensure your account phone/email matches imported client data.",
-        debug: { email: userEmail, phone: normalizePhone(userPhone) }, // remove in production if you want
+        debug: { email: userEmail, phone: normalizePhone(userPhone) },
       });
     }
 
