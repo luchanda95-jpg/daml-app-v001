@@ -82,6 +82,9 @@ function parseCorsOrigins(v) {
   return s.split(",").map((x) => x.trim()).filter(Boolean);
 }
 
+const reportsRoutes = require("./routes/reports");
+app.use("/api", reportsRoutes);
+
 const corsOptions = {
   origin: process.env.NODE_ENV === "production" ? parseCorsOrigins(process.env.CORS_ORIGIN) : true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
