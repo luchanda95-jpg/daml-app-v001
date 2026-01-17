@@ -1,3 +1,4 @@
+// models/Client.js
 const mongoose = require("mongoose");
 
 const ClientSchema = new mongoose.Schema(
@@ -24,5 +25,12 @@ const ClientSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+// Helpful indexes
+ClientSchema.index({ email: 1 });
+ClientSchema.index({ phone: 1 });
+ClientSchema.index({ updatedAt: -1 });
+ClientSchema.index({ statementDate: -1 });
+ClientSchema.index({ lastImportedAt: -1 });
 
 module.exports = mongoose.model("Client", ClientSchema);

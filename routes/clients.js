@@ -19,7 +19,7 @@ function getUserModelSafe() {
 }
 
 // ----------------------------------------------------
-// JWT Auth Middleware (sets req.user)
+// JWT Auth Middleware (sets req.user) - fallback safe
 // ----------------------------------------------------
 function requireAuth(req, res, next) {
   try {
@@ -40,6 +40,29 @@ function requireAuth(req, res, next) {
 
     const payload = jwt.verify(token, secret);
     req.user = payload;
+    return next();
+  } catch (e) {
+    return res.status(401).json({ success: false, message: "Unauthorized" });
+  }
+}
+
+// ----------------------------------------------------
+// Admin guard (ovadmin / branch_admin only)
+// ----------------------------------------------------
+async function requireAdmin(req, res, next) {
+  try {
+    const emailFromToken = String(req.user?.email || req.user?.sub || "").toLowerCase().trim();
+    if (!emailFromToken) return res.status(401).json({ success: false, message: "Unauthorized" });
+
+    const User = getUserModelSafe();
+    const user = await User.findOne({ email: emailFromToken }).lean();
+    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
+
+    const role = String(user.role || req.user?.role || "").toLowerCase().trim();
+    const isAdmin = role === "ovadmin" || role === "branch_admin";
+    if (!isAdmin) return res.status(403).json({ success: false, message: "Forbidden" });
+
+    req.userDb = user;
     return next();
   } catch (e) {
     return res.status(401).json({ success: false, message: "Unauthorized" });
@@ -73,8 +96,8 @@ function phoneVariants(phone) {
   const local9 = p09.startsWith("0") ? p09.slice(1) : p09;
   const variants = new Set();
 
-  variants.add(p09);            // 09XXXXXXXX
-  variants.add(local9);         // 9XXXXXXXX
+  variants.add(p09); // 09XXXXXXXX
+  variants.add(local9); // 9XXXXXXXX
   variants.add("260" + local9); // 2609XXXXXXXX
 
   return Array.from(variants);
@@ -88,8 +111,8 @@ function clientKeyVariants(phone) {
   const local9 = p09.startsWith("0") ? p09.slice(1) : p09;
 
   const variants = new Set();
-  variants.add(`phone:${p09}`);       // phone:097xxxxxxx (matches your DB)
-  variants.add(`phone:${local9}`);    // phone:97xxxxxxx (just in case)
+  variants.add(`phone:${p09}`); // phone:097xxxxxxx (matches your DB)
+  variants.add(`phone:${local9}`); // phone:97xxxxxxx (just in case)
   variants.add(`phone:260${local9}`); // phone:26097... (just in case)
 
   return Array.from(variants);
@@ -101,7 +124,7 @@ function cleanFullName(name) {
   return noTitle
     .split(" ")
     .filter(Boolean)
-    .map(w => w[0].toUpperCase() + w.slice(1).toLowerCase())
+    .map((w) => w[0].toUpperCase() + w.slice(1).toLowerCase())
     .join(" ")
     .trim();
 }
@@ -121,9 +144,7 @@ function toNumber(v) {
   if (typeof v === "object") {
     for (const k of Object.keys(v)) {
       const lk = String(k).toLowerCase();
-      if (lk.includes("number")) {
-        return toNumber(v[k]);
-      }
+      if (lk.includes("number")) return toNumber(v[k]);
     }
     if (v.amount != null) return toNumber(v.amount);
   }
@@ -149,25 +170,113 @@ function pickNearestNextDueDate(loans) {
   const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
   const dates = loans
-    .map(l => (l.nextDueDate ? new Date(l.nextDueDate) : null))
-    .filter(d => d && !isNaN(d.getTime()))
-    .filter(d => d >= startToday)
+    .map((l) => (l.nextDueDate ? new Date(l.nextDueDate) : null))
+    .filter((d) => d && !isNaN(d.getTime()))
+    .filter((d) => d >= startToday)
     .sort((a, b) => a - b);
 
   return dates.length ? dates[0] : null;
 }
 
 function sameDay(a, b) {
-  return a && b &&
+  return (
+    a &&
+    b &&
     a.getFullYear() === b.getFullYear() &&
     a.getMonth() === b.getMonth() &&
-    a.getDate() === b.getDate();
+    a.getDate() === b.getDate()
+  );
 }
 
 // ----------------------------------------------------
 // Router
 // ----------------------------------------------------
 const router = express.Router();
+
+/**
+ * ✅ GET /api/clients
+ * Admin list clients (manual edit screen)
+ * Optional query: ?q=search&limit=500
+ */
+router.get("/", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    const limit = Math.min(parseInt(req.query.limit || "500", 10) || 500, 2000);
+
+    const filter = {};
+    if (q) {
+      const safe = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const rx = new RegExp(safe, "i");
+      filter.$or = [{ fullName: rx }, { email: rx }, { phone: rx }, { clientKey: rx }];
+    }
+
+    const clients = await Client.find(filter)
+      .select("_id clientKey fullName email phone balance statementDate updatedAt lastImportedAt loanStatus statusBucket isExtended")
+      .sort({ updatedAt: -1, statementDate: -1, lastImportedAt: -1 })
+      .limit(limit)
+      .lean();
+
+    return res.json({ success: true, clients });
+  } catch (err) {
+    console.error("GET /api/clients error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+/**
+ * ✅ PUT /api/clients/:id
+ * Admin manual edit (updates the Clients collection)
+ */
+router.put("/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid client id" });
+    }
+
+    const body = req.body || {};
+    const update = {};
+
+    if (body.fullName != null) update.fullName = cleanFullName(body.fullName);
+    if (body.email != null) update.email = String(body.email || "").toLowerCase().trim() || null;
+    if (body.phone != null) update.phone = normalizeZMPhone(body.phone) || null;
+    if (body.address != null) update.address = String(body.address || "").trim() || null;
+
+    // "Actual balance" stored as `balance`
+    if (body.balance != null || body.actualBalance != null) {
+      update.balance = toNumber(body.balance ?? body.actualBalance);
+    }
+
+    const client = await Client.findByIdAndUpdate(id, { $set: update }, { new: true }).lean();
+    if (!client) return res.status(404).json({ success: false, message: "Client not found" });
+
+    return res.json({ success: true, client });
+  } catch (err) {
+    console.error("PUT /api/clients/:id error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+/**
+ * ✅ DELETE /api/clients/:id
+ * Admin delete client (Clients collection)
+ */
+router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid client id" });
+    }
+
+    const result = await Client.deleteOne({ _id: id });
+    if (!result.deletedCount) return res.status(404).json({ success: false, message: "Client not found" });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE /api/clients/:id error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
 
 /**
  * GET /api/clients/me
@@ -227,8 +336,8 @@ router.get("/me", requireAuth, async (req, res) => {
         ? await Loan.find({ $or: loanOrs })
             .select(
               "fullName borrowerMobile borrowerEmail borrowerAddress branchId " +
-              "loanStatus principalAmount amortizationDue totalInterestBalance penaltyAmount " +
-              "nextDueDate importedAt"
+                "loanStatus principalAmount amortizationDue totalInterestBalance penaltyAmount " +
+                "nextDueDate importedAt"
             )
             .lean()
         : [];
@@ -248,7 +357,7 @@ router.get("/me", requireAuth, async (req, res) => {
     // -------------------------
     const totalBorrowed = loans.reduce((s, l) => s + toNumber(l.principalAmount), 0);
 
-    const unpaidLoans = loans.filter(l => loanActualBalance(l) > 0);
+    const unpaidLoans = loans.filter((l) => loanActualBalance(l) > 0);
     const totalBalance = unpaidLoans.reduce((s, l) => s + loanActualBalance(l), 0);
 
     const nextDueDate = pickNearestNextDueDate(unpaidLoans);
@@ -265,7 +374,6 @@ router.get("/me", requireAuth, async (req, res) => {
 
     // -------------------------
     // 4) If client missing but loans exist: optional upsert summary Client
-    //    (helps your app always have a client record)
     // -------------------------
     if (!client && loans.length) {
       const nameGuess = cleanFullName(loans[0].fullName || user.name || "Client");
@@ -288,8 +396,6 @@ router.get("/me", requireAuth, async (req, res) => {
             loanStatus: totalBalance > 0 ? "Unknown" : "Fully Paid",
             statusBucket: totalBalance > 0 ? "balance" : "cleared",
             isExtended: false,
-
-            // stored summary (computed)
             balance: totalBalance,
             statementDate: now,
             lastImportedAt: now,
@@ -308,7 +414,7 @@ router.get("/me", requireAuth, async (req, res) => {
       phone: userPhone09 || client?.phone || null,
       email: userEmail || client?.email || null,
 
-      // ⭐ the important fields your UI needs
+      // important fields
       balance: totalBalance,
       nextDueDate: nextDueDate ? nextDueDate.toISOString() : null,
     };
