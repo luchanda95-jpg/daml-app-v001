@@ -82,6 +82,10 @@ function parseCorsOrigins(v) {
   return s.split(",").map((x) => x.trim()).filter(Boolean);
 }
 
+const notificationsRoute = require("./routes/notifications");
+app.use("/api/notifications", notificationsRoute);
+
+
 const reportsRoutes = require("./routes/reports");
 app.use("/api", reportsRoutes);
 
@@ -91,8 +95,7 @@ const corsOptions = {
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
 };
-app.use(cors(corsOptions));
-
+app.use(cors(corsOptions))
 // Rate limiter (basic)
 const limiter = rateLimit({
   windowMs: 60 * 1000,
