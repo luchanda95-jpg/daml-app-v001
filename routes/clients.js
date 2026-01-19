@@ -111,9 +111,9 @@ function clientKeyVariants(phone) {
   const local9 = p09.startsWith("0") ? p09.slice(1) : p09;
 
   const variants = new Set();
-  variants.add(`phone:${p09}`); // phone:097xxxxxxx (matches your DB)
-  variants.add(`phone:${local9}`); // phone:97xxxxxxx (just in case)
-  variants.add(`phone:260${local9}`); // phone:26097... (just in case)
+  variants.add(`phone:${p09}`); // phone:097xxxxxxx
+  variants.add(`phone:${local9}`); // phone:97xxxxxxx
+  variants.add(`phone:260${local9}`); // phone:26097...
 
   return Array.from(variants);
 }
@@ -194,6 +194,132 @@ function sameDay(a, b) {
 const router = express.Router();
 
 /**
+ * ✅ POST /api/clients/rebuild-from-loans
+ * Admin-only: rebuild Clients summary from Loans
+ * Body: { purgeBad: true }
+ */
+router.post("/rebuild-from-loans", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const purgeBad = !!req.body?.purgeBad;
+
+    // 1) Optional: delete obviously bad email keys (email:... but no "@")
+    let purgedBadClients = 0;
+    if (purgeBad) {
+      const del = await Client.deleteMany({
+        clientKey: { $regex: /^email:/i },
+        $expr: { $eq: [{ $indexOfBytes: ["$clientKey", "@"] }, -1] },
+      });
+      purgedBadClients = del.deletedCount || 0;
+    }
+
+    // 2) Stream loans and build groups by clientKey
+    const groups = new Map();
+
+    const cursor = Loan.find({})
+      .select(
+        "fullName borrowerMobile borrowerEmail borrowerAddress " +
+          "loanStatus principalAmount amortizationDue totalInterestBalance penaltyAmount " +
+          "nextDueDate importedAt"
+      )
+      .lean()
+      .cursor();
+
+    for await (const loan of cursor) {
+      const phone09 = normalizeZMPhone(loan.borrowerMobile || "");
+      const email = String(loan.borrowerEmail || "").toLowerCase().trim();
+
+      // Prefer phone-based key, else email-based key
+      const clientKey = phone09 ? `phone:${phone09}` : email ? `email:${email}` : "";
+      if (!clientKey) continue;
+
+      let g = groups.get(clientKey);
+      if (!g) {
+        g = {
+          clientKey,
+          fullName: "",
+          phone: phone09 || null,
+          email: email || null,
+          address: "",
+          balance: 0,
+          statementDate: null,
+          lastImportedAt: null,
+        };
+        groups.set(clientKey, g);
+      }
+
+      // Fill missing profile fields
+      if (!g.fullName && loan.fullName) g.fullName = cleanFullName(loan.fullName);
+      if (!g.phone && phone09) g.phone = phone09;
+      if (!g.email && email) g.email = email;
+      if (!g.address && loan.borrowerAddress) g.address = String(loan.borrowerAddress).trim();
+
+      // Sum balances using your rule
+      g.balance += loanActualBalance(loan);
+
+      // Track latest importedAt
+      const imp = loan.importedAt ? new Date(loan.importedAt) : null;
+      if (imp && (!g.statementDate || imp > g.statementDate)) g.statementDate = imp;
+      if (imp && (!g.lastImportedAt || imp > g.lastImportedAt)) g.lastImportedAt = imp;
+    }
+
+    // 3) Bulk upsert into Clients
+    let rebuiltClients = 0;
+    const ops = [];
+
+    for (const g of groups.values()) {
+      rebuiltClients++;
+
+      const totalBalance = Number(g.balance || 0);
+      const statusBucket = totalBalance > 0 ? "balance" : "cleared";
+      const loanStatus = totalBalance > 0 ? "Unknown" : "Fully Paid";
+
+      ops.push({
+        updateOne: {
+          filter: { clientKey: g.clientKey },
+          update: {
+            $set: {
+              clientKey: g.clientKey,
+              fullName: g.fullName || "",
+              phone: g.phone,
+              email: g.email,
+              address: g.address || null,
+
+              balance: totalBalance,
+
+              loanStatus,
+              statusBucket,
+              isExtended: false,
+
+              statementDate: g.statementDate || new Date(),
+              lastImportedAt: g.lastImportedAt || new Date(),
+            },
+          },
+          upsert: true,
+        },
+      });
+
+      if (ops.length >= 1000) {
+        await Client.bulkWrite(ops, { ordered: false });
+        ops.length = 0;
+      }
+    }
+
+    if (ops.length) {
+      await Client.bulkWrite(ops, { ordered: false });
+    }
+
+    return res.json({
+      success: true,
+      purgedBadClients,
+      rebuiltClients,
+    });
+  } catch (err) {
+    console.error("POST /api/clients/rebuild-from-loans error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
+/**
  * ✅ GET /api/clients
  * Admin list clients (manual edit screen)
  * Optional query: ?q=search&limit=500
@@ -207,11 +333,11 @@ router.get("/", requireAuth, requireAdmin, async (req, res) => {
     if (q) {
       const safe = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const rx = new RegExp(safe, "i");
-      filter.$or = [{ fullName: rx }, { email: rx }, { phone: rx }, { clientKey: rx }];
+      filter.$or = [{ fullName: rx }, { email: rx }, { phone: rx }, { clientKey: rx }, { address: rx }];
     }
 
     const clients = await Client.find(filter)
-      .select("_id clientKey fullName email phone balance statementDate updatedAt lastImportedAt loanStatus statusBucket isExtended")
+      .select("_id clientKey fullName email phone address balance statementDate updatedAt lastImportedAt loanStatus statusBucket isExtended")
       .sort({ updatedAt: -1, statementDate: -1, lastImportedAt: -1 })
       .limit(limit)
       .lean();
@@ -281,18 +407,12 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
 /**
  * GET /api/clients/me
  * Optional query: ?includeLoans=true
- *
- * Returns:
- *  - client: {... balance, nextDueDate ...}
- *  - loansSummary: totals (borrowed, due, nextDueAmount, loanCount)
- *  - loans: optional list
  */
 router.get("/me", requireAuth, async (req, res) => {
   try {
     const emailFromToken = String(req.user?.email || req.user?.sub || "").toLowerCase().trim();
     if (!emailFromToken) return res.status(401).json({ success: false, message: "Unauthorized" });
 
-    // confirm user exists in Users collection (optional but good)
     const User = getUserModelSafe();
     const user = await User.findOne({ email: emailFromToken }).lean();
     if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
@@ -302,9 +422,7 @@ router.get("/me", requireAuth, async (req, res) => {
     const variants = phoneVariants(userPhone09);
     const keyVariants = clientKeyVariants(userPhone09);
 
-    // -------------------------
     // 1) Find Client (email/phone/clientKey)
-    // -------------------------
     const ors = [];
     if (userEmail) ors.push({ email: userEmail });
     if (variants.length) ors.push({ phone: { $in: variants } });
@@ -317,11 +435,7 @@ router.get("/me", requireAuth, async (req, res) => {
         .lean();
     }
 
-    // -------------------------
-    // 2) Loans source:
-    //    - If client has embedded loans array -> use it
-    //    - Else -> fetch from Loan collection
-    // -------------------------
+    // 2) Fetch loans (from embedded or Loan collection)
     const embeddedLoans = Array.isArray(client?.loans) ? client.loans : null;
 
     let loans = [];
@@ -343,7 +457,6 @@ router.get("/me", requireAuth, async (req, res) => {
         : [];
     }
 
-    // If nothing found at all
     if (!client && loans.length === 0) {
       return res.status(404).json({
         success: false,
@@ -352,11 +465,8 @@ router.get("/me", requireAuth, async (req, res) => {
       });
     }
 
-    // -------------------------
-    // 3) Compute totals from loans (single source of truth)
-    // -------------------------
+    // 3) Compute totals
     const totalBorrowed = loans.reduce((s, l) => s + toNumber(l.principalAmount), 0);
-
     const unpaidLoans = loans.filter((l) => loanActualBalance(l) > 0);
     const totalBalance = unpaidLoans.reduce((s, l) => s + loanActualBalance(l), 0);
 
@@ -366,21 +476,16 @@ router.get("/me", requireAuth, async (req, res) => {
     if (nextDueDate) {
       for (const l of unpaidLoans) {
         const d = l.nextDueDate ? new Date(l.nextDueDate) : null;
-        if (d && sameDay(d, nextDueDate)) {
-          nextDueAmount += toNumber(l.amortizationDue);
-        }
+        if (d && sameDay(d, nextDueDate)) nextDueAmount += toNumber(l.amortizationDue);
       }
     }
 
-    // -------------------------
-    // 4) If client missing but loans exist: optional upsert summary Client
-    // -------------------------
+    // 4) If client missing but loans exist: create summary Client
     if (!client && loans.length) {
       const nameGuess = cleanFullName(loans[0].fullName || user.name || "Client");
       const phoneGuess = userPhone09 || normalizeZMPhone(loans[0].borrowerMobile || "");
       const emailGuess = userEmail || (loans[0].borrowerEmail || "").toLowerCase();
 
-      // match your DB pattern: phone:097xxxxxxx
       const clientKey = phoneGuess ? `phone:${phoneGuess}` : `email:${emailGuess}`;
 
       const now = new Date();
@@ -405,16 +510,12 @@ router.get("/me", requireAuth, async (req, res) => {
       ).lean();
     }
 
-    // -------------------------
-    // 5) Build response payload
-    // -------------------------
+    // 5) Response payload
     const payload = {
       ...(client || {}),
       fullName: cleanFullName((client?.fullName || user.name || "").trim()),
       phone: userPhone09 || client?.phone || null,
       email: userEmail || client?.email || null,
-
-      // important fields
       balance: totalBalance,
       nextDueDate: nextDueDate ? nextDueDate.toISOString() : null,
     };
@@ -434,7 +535,6 @@ router.get("/me", requireAuth, async (req, res) => {
     };
 
     if (includeLoans) response.loans = loans;
-
     return res.json(response);
   } catch (err) {
     console.error("GET /api/clients/me error:", err);
