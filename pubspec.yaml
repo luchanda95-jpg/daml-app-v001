@@ -1,0 +1,104 @@
+name: daml
+description: A direct access money lending app for daily reporting offline-first.
+
+version: 1.0.2+3
+
+environment:
+  sdk: ">=3.8.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.6
+
+  # Offline Storage
+  local_auth: ^2.2.0
+  shared_preferences: ^2.2.2
+  hive: ^2.2.3
+  hive_flutter: any
+  path_provider: ^2.1.1
+
+  # UI / Icons / Charts
+  lucide_icons: ^0.257.0
+  syncfusion_flutter_charts: ^23.1.40
+  fl_chart: ^0.69.0
+
+  # Security / Networking
+  flutter_secure_storage: ^8.0.0
+  dbcrypt: ^2.0.0
+  dio: ^5.3.0
+  pretty_dio_logger: ^1.3.0
+  http: ^1.5.0
+
+  # Documents
+  pdf: ^3.10.8
+  printing: ^5.13.3
+  cross_file: ^0.3.4
+
+  # Form Helpers
+  intl: ^0.18.1
+  flutter_typeahead: ^4.1.2
+
+  # UI Helpers
+  syncfusion_flutter_datepicker: ^23.1.36
+  flutter_easyloading: ^3.0.5
+  flutter_speed_dial: ^7.0.0
+  sticky_headers: ^0.3.0+2
+
+  # Data Export
+  share_plus: ^7.0.2
+  csv: ^5.0.1
+  excel: ^4.0.6
+
+  # Connectivity / State
+  connectivity_plus: ^6.1.4
+  provider: ^6.1.5+1
+  video_player: ^2.10.1
+  firebase_core: ^4.3.0
+  firebase_messaging: ^16.1.0
+  permission_handler: ^12.0.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  hive_generator: ^2.0.0
+  build_runner: ^2.4.6
+
+  flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.13.1
+  flutter_native_splash: ^2.4.2
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/icon.png"
+  adaptive_icon_background: "#052E33"
+  adaptive_icon_foreground: "assets/icon/icon_foreground.png"
+
+flutter_native_splash:
+  android: true
+  ios: true
+  color: "#052E33"
+  image: assets/splash/logo.png
+
+  branding: assets/splash/branding.png
+  branding_mode: bottom
+  branding_bottom_padding: 24
+
+  android_12:
+    color: "#052E33"
+    image: assets/splash/logo_a12.png
+    branding: assets/splash/branding_a12.png
+    icon_background_color: "#052E33"
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/
+    - assets/images/
+    - assets/icon/
+    - assets/splash/
+    - assets/lottie/

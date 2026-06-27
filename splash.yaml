@@ -1,0 +1,15 @@
+flutter_native_splash:
+  color: "#F7FAFD" # Updated to match AppColors.LIGHT_BACKGROUND
+  color_dark: "#000000" # Updated to match AppColors.DARK_BACKGROUND
+  image: assets/images/logos/logo1.png
+  image_dark: assets/images/logos/logo2.png
+
+  # Specific settings for Android 12 and higher (for the splash screen API)
+  android_12:
+    color: "#F7FAFD" # Updated to match AppColors.LIGHT_BACKGROUND
+    color_dark: "#000000" # Updated to match AppColors.DARK_BACKGROUND
+    image: assets/images/logos/logo1.png
+    image_dark: assets/images/logos/logo2.png
+
+  # Set web to false if you don't want to generate a web splash screen
+  web: false
