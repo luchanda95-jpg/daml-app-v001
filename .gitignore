@@ -43,6 +43,22 @@ app.*.symbols
 # Obfuscation related
 app.*.map.json
 
+
+# Signing — NEVER commit these
+android/key.properties
+**/*.jks
+**/*.keystore
+
+# Firebase (contains API keys — your call, but often kept private)
+android/app/google-services.json
+
+# Flutter/Dart
+.dart_tool/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.lock
+
 # Android Studio will place build artifacts here
 /android/app/debug
 /android/app/profile
