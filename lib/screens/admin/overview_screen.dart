@@ -2,6 +2,7 @@
 // ignore_for_file: unused_import, deprecated_member_use
 
 import 'package:flutter/material.dart';
+import 'package:daml/widgets/app_skeleton.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:daml/models/report_model.dart';
 import 'package:intl/intl.dart';
@@ -29,7 +30,7 @@ class OverviewScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (loading) return const Center(child: CircularProgressIndicator());
+    if (loading) return const AppPageSkeleton();
 
     if (error != null && error!.isNotEmpty) {
       return Center(

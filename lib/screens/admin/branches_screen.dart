@@ -4,12 +4,14 @@
 import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:daml/widgets/app_skeleton.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:daml/models/report_model.dart';
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:csv/csv.dart';
+import 'package:daml/theme/app_colors.dart';
 
 class BranchesScreen extends StatefulWidget {
   final int pendingCount;
@@ -41,13 +43,13 @@ class _BranchesScreenState extends State<BranchesScreen> {
   bool _showValueLabels = true;
 
   final NumberFormat _currency = NumberFormat.currency(symbol: 'K ', decimalDigits: 2);
-  final Color _accentColor = Colors.blueAccent;
-  final Color _successColor = Colors.greenAccent;
-  final Color _warningColor = Colors.orangeAccent;
+  final Color _accentColor = AppColors.GREEN;
+  final Color _successColor = AppColors.GREEN_DARK;
+  final Color _warningColor = AppColors.WARNING;
 
   @override
   Widget build(BuildContext context) {
-    if (widget.loading) return const Center(child: CircularProgressIndicator());
+    if (widget.loading) return const AppPageSkeleton();
 
     if (widget.error != null && widget.error!.isNotEmpty) {
       return Center(

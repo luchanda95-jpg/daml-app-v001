@@ -1,5 +1,6 @@
 // lib/screens/branch/expense_allocations_screen.dart
 import 'package:flutter/material.dart';
+import 'package:daml/widgets/app_skeleton.dart';
 import 'package:intl/intl.dart';
 import 'package:daml/models/expense_item.dart';
 import 'package:daml/services/expense_repository.dart';
@@ -85,7 +86,7 @@ class _ExpenseAllocationsScreenState extends State<ExpenseAllocationsScreen> {
       body: FutureBuilder<List<ExpenseItem>>(
         future: _futureItems,
         builder: (context, snap) {
-          if (snap.connectionState != ConnectionState.done) return const Center(child: CircularProgressIndicator());
+          if (snap.connectionState != ConnectionState.done) return const AppPageSkeleton(cards: 4);
           final items = snap.data ?? [];
           if (items.isEmpty) {
             return Center(child: Text('No expenses recorded for ${widget.branchName}'));

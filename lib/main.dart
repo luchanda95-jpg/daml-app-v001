@@ -3,7 +3,6 @@
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'dart:ui';
 
 // ✅ Screens & Services
 import 'root_gate.dart';
@@ -15,9 +14,13 @@ import 'screens/admin/admin.dart';
 import 'package:daml/screens/client/widgets/client_dashboard.dart';
 import 'theme/app_theme.dart';
 import 'theme/theme_service.dart';
+import 'services/supabase_daml_service.dart';
+import 'services/local_storage.dart';
 
 // ✅ New Components
-import 'widgets/logo_loader.dart'; // Ensure this matches your file path
+import 'widgets/app_skeleton.dart';
+import 'widgets/connectivity_banner.dart';
+import 'providers/loading_provider.dart';
 
 // ✅ Firebase imports
 import 'package:firebase_core/firebase_core.dart';
@@ -33,6 +36,12 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // ✅ Initialize Hive/local cache first so offline reports are always available.
+  await LocalStorage.init();
+
+  // ✅ Initialize Supabase (direct backend). If dart-defines are missing, it safely falls back.
+  await SupabaseDamlService.initialize();
 
   // ✅ Initialize Firebase
   await Firebase.initializeApp(
@@ -69,30 +78,20 @@ class DamlApp extends StatelessWidget {
       darkTheme: AppTheme.darkTheme,
       themeMode: themeService.themeMode,
 
-      // --- GLOBAL LOADER BUILDER ---
-      // This wraps every route in the app with a Stack
+      // --- UNIFIED CONNECTIVITY + LOADING LAYER ---
       builder: (context, child) {
-        return Stack(
-          children: [
-            if (child != null) child,
-            Consumer<LoadingProvider>(
-              builder: (context, loading, _) {
-                if (!loading.isLoading) return const SizedBox.shrink();
-
-                return Container(
-                  // Subtle blur and dimming to make the loader pop
-                  color: Colors.black.withOpacity(0.4),
-                  child: BackdropFilter(
-                    filter: ImageFilter.blur(sigmaX: 4, sigmaY: 4),
-                    child: Scaffold(
-                      backgroundColor: Colors.transparent,
-                      body: LogoLoader(message: loading.message),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ],
+        return ConnectivityBanner(
+          child: Stack(
+            children: [
+              if (child != null) child,
+              Consumer<LoadingProvider>(
+                builder: (context, loading, _) {
+                  if (!loading.isLoading) return const SizedBox.shrink();
+                  return AppLoadingOverlay(message: loading.message);
+                },
+              ),
+            ],
+          ),
         );
       },
 
@@ -116,26 +115,5 @@ class DamlApp extends StatelessWidget {
         );
       },
     );
-  }
-}
-
-// --- LOADING PROVIDER ---
-// You can move this to lib/providers/loading_provider.dart later
-class LoadingProvider extends ChangeNotifier {
-  bool _isLoading = false;
-  String _message = "Please wait...";
-
-  bool get isLoading => _isLoading;
-  String get message => _message;
-
-  void show(String msg) {
-    _message = msg;
-    _isLoading = true;
-    notifyListeners();
-  }
-
-  void hide() {
-    _isLoading = false;
-    notifyListeners();
   }
 }

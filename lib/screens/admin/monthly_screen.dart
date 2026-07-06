@@ -4,10 +4,12 @@
 import 'dart:math' as math;
 import 'package:daml/models/monthly_report_model.dart';
 import 'package:flutter/material.dart';
+import 'package:daml/widgets/app_skeleton.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:intl/intl.dart';
 import 'package:daml/screens/branch/monthly_report_detail_screen.dart';
 import 'package:daml/services/api_service.dart';
+import 'package:daml/services/local_storage.dart';
 
 class MonthlyScreen extends StatefulWidget {
   final int pendingCount;
@@ -64,7 +66,36 @@ class _MonthlyScreenState extends State<MonthlyScreen> {
       }
       setState(() { _fetchedReports = parsed; _loading = false; });
     } catch (e) {
-      setState(() { _loading = false; _error = e.toString(); });
+      try {
+        await LocalStorage.ensureInitialized();
+        final cached = LocalStorage.getAllMonthlyReports()
+          ..sort((a, b) => b.date.compareTo(a.date));
+
+        if (!mounted) return;
+        setState(() {
+          _fetchedReports = cached;
+          _loading = false;
+          _error = cached.isEmpty
+              ? "You're currently offline. Connect to refresh monthly reports."
+              : null;
+        });
+
+        if (cached.isNotEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                "You're currently offline. Showing monthly reports saved on this device.",
+              ),
+            ),
+          );
+        }
+      } catch (_) {
+        if (!mounted) return;
+        setState(() {
+          _loading = false;
+          _error = "You're currently offline. Connect to refresh monthly reports.";
+        });
+      }
     }
   }
 
@@ -79,7 +110,7 @@ class _MonthlyScreenState extends State<MonthlyScreen> {
   @override
   Widget build(BuildContext context) {
     final reports = (widget.reports != null && widget.reports!.isNotEmpty) ? widget.reports! : _fetchedReports;
-    if (_loading) return const Center(child: CircularProgressIndicator());
+    if (_loading) return const AppPageSkeleton();
     if (_error != null) return _errorState();
     if (reports.isEmpty) return _emptyState();
 

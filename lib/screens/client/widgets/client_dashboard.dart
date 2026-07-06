@@ -1,6 +1,6 @@
 // lib/screens/client/client_dashboard_screen.dart
 // Complete Client Dashboard with server integration
-// Fetches client details and loan balance from /api/clients/me
+// Fetches client details and loan balance from Supabase via ApiService.fetchMyClient
 //
 // Updates you requested:
 // ✅ Removed Quick Actions section
@@ -14,6 +14,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:daml/widgets/app_skeleton.dart';
 import 'package:intl/intl.dart';
 import 'package:daml/models/client.dart';
 import 'package:daml/models/loan.dart';
@@ -35,7 +36,7 @@ class ClientDashboardScreen extends StatefulWidget {
   State<ClientDashboardScreen> createState() => _ClientDashboardScreenState();
 }
 
-class _ClientDashboardScreenState extends State<ClientDashboardScreen> {
+class _ClientDashboardScreenState extends State<ClientDashboardScreen> with WidgetsBindingObserver {
   // UI State
   bool _loading = true;
   bool _refreshing = false;
@@ -62,9 +63,10 @@ class _ClientDashboardScreenState extends State<ClientDashboardScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadClientData();
-    // Set up auto-refresh every 5 minutes
-    _refreshTimer = Timer.periodic(const Duration(minutes: 5), (timer) {
+    // Keep live balances fresh while the client dashboard is open.
+    _refreshTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
       if (mounted && !_refreshing) {
         _loadClientData(forceRefresh: true, showSnackbar: false);
       }
@@ -73,8 +75,16 @@ class _ClientDashboardScreenState extends State<ClientDashboardScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _refreshTimer?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && mounted && !_refreshing) {
+      _loadClientData(forceRefresh: true, showSnackbar: false);
+    }
   }
 
   // ============================================================
@@ -179,13 +189,11 @@ class _ClientDashboardScreenState extends State<ClientDashboardScreen> {
     });
 
     try {
-      // Build query parameters
-      final params = includeLoans ? {'includeLoans': 'true'} : null;
+      // Call the unified dashboard loader. When Supabase is configured,
+      // ApiService.fetchMyClient reads directly from Supabase instead of the old Node /clients/me route.
+      final response = await ApiService.fetchMyClient(includeLoans: includeLoans);
 
-      // Call the API
-      final response = await ApiService.get('/clients/me', query: params, retry: true);
-
-      if (response is Map && response['success'] == true) {
+      if (response['success'] == true) {
         // Parse client data
         if (response['client'] != null) {
           final clientData = Map<String, dynamic>.from(response['client']);
@@ -210,6 +218,7 @@ class _ClientDashboardScreenState extends State<ClientDashboardScreen> {
 
         setState(() {});
       } else {
+        // ignore: unnecessary_type_check
         final errorMsg = (response is Map) ? (response['message'] ?? 'Failed to fetch client data') : 'Failed to fetch client data';
         throw Exception(errorMsg);
       }
@@ -403,56 +412,41 @@ class _ClientDashboardScreenState extends State<ClientDashboardScreen> {
                         color: Theme.of(context).colorScheme.primary,
                       ),
 
-                    // Client Summary Card
+                    // Clean client summary: only Borrowed and Current Balance.
                     _buildClientSummary(),
-                    const SizedBox(height: 16),
-
-                    // Loans Section
-                    _buildLoansSection(),
-
-                    // Last Updated Info
-                    _buildLastUpdatedInfo(),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      height: 46,
+                      child: OutlinedButton.icon(
+                        onPressed: () {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => const LoanCalculatorScreen(),
+                            ),
+                          );
+                        },
+                        icon: const Icon(Icons.calculate_outlined, size: 20),
+                        label: const Text(
+                          'Loan Calculator',
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                        style: OutlinedButton.styleFrom(
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
                   ],
                 ),
               ),
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () {
-          Navigator.of(context).push(
-            MaterialPageRoute(builder: (_) => const LoanCalculatorScreen()),
-          );
-        },
-        icon: const Icon(Icons.calculate),
-        label: const Text('Calculator'),
-        backgroundColor: Theme.of(context).colorScheme.primary,
       ),
     );
   }
 
   Widget _buildLoadingState() {
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          CircularProgressIndicator(
-            color: Theme.of(context).colorScheme.primary,
-          ),
-          const SizedBox(height: 20),
-          Text(
-            'Loading your dashboard...',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
-          const SizedBox(height: 8),
-          Text(
-            'Please wait while we fetch your account information',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: AppColors.SECONDARY,
-                ),
-            textAlign: TextAlign.center,
-          ),
-        ],
-      ),
-    );
+    return const AppPageSkeleton(cards: 4);
   }
 
   Widget _buildErrorState() {
@@ -509,35 +503,9 @@ class _ClientDashboardScreenState extends State<ClientDashboardScreen> {
 
   Widget _buildClientSummary() {
     if (_clientLoading && _client == null) {
-      return Card(
-        elevation: 2,
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Row(
-            children: [
-              CircularProgressIndicator(color: Theme.of(context).colorScheme.primary),
-              const SizedBox(width: 16),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      "Loading your account...",
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      "Fetching your client information",
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: AppColors.SECONDARY,
-                          ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
+      return const Padding(
+        padding: EdgeInsets.only(bottom: 12),
+        child: AppSkeleton(height: 128, radius: 18),
       );
     }
 
@@ -627,9 +595,14 @@ class _ClientDashboardScreenState extends State<ClientDashboardScreen> {
     final c = _client!;
 
     // Extract data from loans summary
-    final loanCount = _loansSummary['loanCount'] ?? _loans.length;
-    final totalBorrowed = (_loansSummary['totalBorrowed'] ?? 0.0).toDouble();
-    final totalBalance = (_loansSummary['totalBalance'] ?? c.balance).toDouble();
+    final rawBalance = (_loansSummary['totalBalance'] ?? c.balance).toDouble();
+    final totalBalance = rawBalance > 0.01 ? rawBalance : 0.0;
+
+    // A cleared/no-loan account must show a clean zero state.
+    // We intentionally do not carry historical principal into the live dashboard.
+    final rawBorrowed = (_loansSummary['totalBorrowed'] ?? 0.0).toDouble();
+    final totalBorrowed = totalBalance > 0.0 ? rawBorrowed : 0.0;
+    final loanCount = totalBalance > 0.0 ? (_loansSummary['loanCount'] ?? _loans.length) : 0;
 
     // Parse next due date
     DateTime? nextDueDate;
@@ -675,156 +648,190 @@ class _ClientDashboardScreenState extends State<ClientDashboardScreen> {
     );
   }
 
-  Widget _buildLoansSection() {
-    if (_loans.isEmpty && _client != null) {
-      return Card(
-        elevation: 2,
-        child: Padding(
-          padding: const EdgeInsets.all(24.0),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                Icons.credit_score_outlined,
-                size: 64,
-                color: Theme.of(context).colorScheme.onSurface.withOpacity(0.12),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'No Active Loans',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w600,
-                    ),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                'You don\'t have any active loans at the moment.\nApply for a new loan to get started.',
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: AppColors.SECONDARY,
-                    ),
-              ),
-              const SizedBox(height: 20),
-              FilledButton(
-                onPressed: () {
-                  Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const ClientAgreementForm()),
-                  );
-                },
-                style: FilledButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 48),
-                ),
-                child: const Text('Apply for a Loan'),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
+  double _summaryAmount(String key, {double fallback = 0.0}) {
+    final value = _loansSummary[key];
+    if (value == null) return fallback;
+    if (value is num) return value.toDouble();
+    return double.tryParse(value.toString().replaceAll(',', '').trim()) ?? fallback;
+  }
 
-    if (_loans.isEmpty) return const SizedBox();
+  int _summaryInt(String key, {int fallback = 0}) {
+    final value = _loansSummary[key];
+    if (value == null) return fallback;
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    return int.tryParse(value.toString()) ?? fallback;
+  }
+
+  Widget _buildLoansSection() {
+    if (_client == null) return const SizedBox();
 
     final colorScheme = Theme.of(context).colorScheme;
+    final currentBalance = _summaryAmount('totalBalance', fallback: _client!.balance);
+    final totalBorrowed = _summaryAmount('totalBorrowed');
+    final nextDueAmount = _summaryAmount('nextDueAmount');
+    final activeLoanCount = _summaryInt('loanCount');
+    final pastLoanCount = _summaryInt('pastLoanCount');
+    final source = (_loansSummary['source'] ?? '').toString();
+
+    DateTime? nextDueDate;
+    final rawNextDue = _loansSummary['nextDueDate'];
+    if (rawNextDue != null) {
+      nextDueDate = DateTime.tryParse(rawNextDue.toString());
+    }
+
+    final isCleared = currentBalance <= 0.01;
+    final statusText = isCleared ? 'Cleared' : 'Active Balance';
+    final statusColor = isCleared ? AppColors.SUCCESS : colorScheme.primary;
 
     return Card(
       elevation: 2,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Row(
               children: [
-                Icon(
-                  Icons.credit_card,
-                  color: colorScheme.primary,
-                  size: 20,
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  'Your Loans',
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w600,
-                      ),
-                ),
-                const SizedBox(width: 8),
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  width: 46,
+                  height: 46,
                   decoration: BoxDecoration(
-                    color: colorScheme.primary.withOpacity(0.08),
-                    borderRadius: BorderRadius.circular(12),
+                    color: statusColor.withOpacity(0.10),
+                    borderRadius: BorderRadius.circular(23),
+                  ),
+                  child: Icon(
+                    isCleared ? Icons.check_circle_outline : Icons.account_balance_wallet_outlined,
+                    color: statusColor,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Current Loan Balance',
+                        style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        isCleared
+                            ? 'This client account is currently cleared. Past loans are not counted as active debt.'
+                            : 'This is the current outstanding balance only. Past cleared loans are hidden from the dashboard.',
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(color: AppColors.SECONDARY),
+                      ),
+                    ],
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: statusColor.withOpacity(0.10),
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(color: statusColor.withOpacity(0.25)),
                   ),
                   child: Text(
-                    '${_loans.length}',
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          fontWeight: FontWeight.w600,
-                          color: colorScheme.primary,
-                        ),
+                    statusText,
+                    style: TextStyle(color: statusColor, fontSize: 12, fontWeight: FontWeight.w800),
                   ),
-                ),
-                const Spacer(),
-                TextButton(
-                  onPressed: () {
-                    // Show all loans in expanded view
-                    Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => Scaffold(
-                          appBar: AppBar(
-                            title: const Text('All Loans'),
-                          ),
-                          body: ListView.builder(
-                            padding: const EdgeInsets.all(16),
-                            itemCount: _loans.length,
-                            itemBuilder: (context, index) {
-                              return _buildLoanTile(_loans[index], expanded: true);
-                            },
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                  child: const Text('View All'),
                 ),
               ],
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 18),
             Text(
-              'Tap any loan to view details',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: AppColors.SECONDARY,
+              _formatCurrency(currentBalance, symbol: 'ZMW '),
+              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                    fontWeight: FontWeight.w900,
+                    color: isCleared ? AppColors.SUCCESS : colorScheme.primary,
                   ),
             ),
-            const SizedBox(height: 12),
-            Column(
-              children: _loans.take(3).map((loan) => _buildLoanTile(loan)).toList(),
+            const SizedBox(height: 14),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final narrow = constraints.maxWidth < 560;
+                final tiles = [
+                  _balanceInfoTile(
+                    icon: Icons.receipt_long_outlined,
+                    label: 'Active loans',
+                    value: activeLoanCount.toString(),
+                  ),
+                  _balanceInfoTile(
+                    icon: Icons.credit_card_outlined,
+                    label: 'Current principal',
+                    value: _formatCurrency(totalBorrowed, symbol: 'ZMW '),
+                  ),
+                  _balanceInfoTile(
+                    icon: Icons.event_available_outlined,
+                    label: 'Next due',
+                    value: nextDueDate == null
+                        ? 'Not set'
+                        : '${_formatCurrency(nextDueAmount, symbol: 'ZMW ')} • ${_formatDate(nextDueDate)}',
+                  ),
+                ];
+
+                if (narrow) {
+                  return Column(
+                    children: tiles.map((tile) => Padding(padding: const EdgeInsets.only(bottom: 8), child: tile)).toList(),
+                  );
+                }
+                return Row(
+                  children: tiles
+                      .map((tile) => Expanded(child: Padding(padding: const EdgeInsets.only(right: 8), child: tile)))
+                      .toList(),
+                );
+              },
             ),
-            if (_loans.length > 3)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: TextButton(
-                  onPressed: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => Scaffold(
-                          appBar: AppBar(
-                            title: const Text('All Loans'),
-                          ),
-                          body: ListView.builder(
-                            padding: const EdgeInsets.all(16),
-                            itemCount: _loans.length,
-                            itemBuilder: (context, index) {
-                              return _buildLoanTile(_loans[index], expanded: true);
-                            },
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                  child: Text('Show ${_loans.length - 3} more loans'),
-                ),
+            if (pastLoanCount > 0 || source.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(
+                pastLoanCount > 0
+                    ? '$pastLoanCount past loan record${pastLoanCount == 1 ? '' : 's'} found but excluded from the current balance.'
+                    : 'Balance source: $source',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: AppColors.SECONDARY),
               ),
+            ],
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const ClientAgreementForm()),
+                );
+              },
+              icon: const Icon(Icons.add_circle_outline),
+              label: Text(isCleared ? 'Apply for a Loan' : 'Apply / Top Up'),
+            ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _balanceInfoTile({required IconData icon, required String label, required String value}) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceVariant.withOpacity(0.35),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Theme.of(context).dividerColor.withOpacity(0.4)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 18, color: AppColors.SECONDARY),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: AppColors.SECONDARY)),
+                const SizedBox(height: 4),
+                Text(value, style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w800)),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -991,27 +998,7 @@ class _ClientDashboardScreenState extends State<ClientDashboardScreen> {
   }
 
   Future<void> _showLoanDetails(Loan loan) async {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => const AlertDialog(
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(height: 16),
-            Text('Loading loan details...'),
-          ],
-        ),
-      ),
-    );
-
-    await Future.delayed(const Duration(milliseconds: 300));
-
     if (!mounted) return;
-
-    Navigator.of(context).pop();
-
     showDialog(
       context: context,
       barrierDismissible: true,
@@ -1089,43 +1076,42 @@ class ClientDashboardCard extends StatelessWidget {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
 
-    final nextDueText = _formatCurrency(nextDueAmount);
-    final amountDueText = _formatCurrency(amountDue);
-    final borrowedText = _formatCurrency(amountBorrowed);
+    // The dashboard is a live account view, not loan history.
+    // Once the outstanding balance is cleared, both figures reset to zero.
+    final hasOutstandingBalance = amountDue > 0.01;
+    final displayBalance = hasOutstandingBalance ? amountDue : 0.0;
+    final displayBorrowed = hasOutstandingBalance ? amountBorrowed : 0.0;
 
-    final isOverdue = nextDueDate != null && nextDueDate!.isBefore(DateTime.now());
-    final daysUntilDue = nextDueDate?.difference(DateTime.now()).inDays;
-
-    final balText = (clientBalance == null) ? null : _formatCurrency(clientBalance!);
-    final statementText = statementDate == null ? null : _formatDate(statementDate!);
+    final borrowedText = _formatCurrency(displayBorrowed);
+    final balanceText = _formatCurrency(displayBalance);
 
     return Card(
-      elevation: 3,
+      elevation: 2,
+      margin: EdgeInsets.zero,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(18),
       ),
       child: Padding(
-        padding: const EdgeInsets.all(20.0),
+        padding: const EdgeInsets.all(20),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // Header
             Row(
               children: [
                 Container(
-                  width: 56,
-                  height: 56,
+                  width: 52,
+                  height: 52,
                   decoration: BoxDecoration(
-                    color: colorScheme.primary.withOpacity(0.1),
+                    color: colorScheme.primary.withOpacity(0.10),
                     shape: BoxShape.circle,
                   ),
                   child: Icon(
                     Icons.person,
                     color: colorScheme.primary,
-                    size: 28,
+                    size: 26,
                   ),
                 ),
-                const SizedBox(width: 16),
+                const SizedBox(width: 14),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -1133,176 +1119,127 @@ class ClientDashboardCard extends StatelessWidget {
                       Text(
                         name,
                         style: textTheme.titleLarge?.copyWith(
-                          fontWeight: FontWeight.w700,
+                          fontWeight: FontWeight.w800,
                         ),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
-                      const SizedBox(height: 4),
-                      Text(
-                        email,
-                        style: textTheme.bodyMedium?.copyWith(
-                          color: AppColors.SECONDARY,
+                      if (email.trim().isNotEmpty) ...[
+                        const SizedBox(height: 3),
+                        Text(
+                          email,
+                          style: textTheme.bodySmall?.copyWith(
+                            color: AppColors.SECONDARY,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ],
-                  ),
-                ),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: colorScheme.primary.withOpacity(0.08),
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.credit_card,
-                        size: 16,
-                        color: colorScheme.primary,
-                      ),
-                      const SizedBox(width: 4),
-                      Text(
-                        '$loanCount ${loanCount == 1 ? 'loan' : 'loans'}',
-                        style: textTheme.bodySmall?.copyWith(
-                          fontWeight: FontWeight.w600,
-                          color: colorScheme.primary,
-                        ),
-                      ),
+                      ],
                     ],
                   ),
                 ),
               ],
             ),
-
-            // Status Badges
-            if ((clientBucket ?? '').isNotEmpty || (clientStatus ?? '').isNotEmpty) ...[
-              const SizedBox(height: 16),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  if ((clientBucket ?? '').isNotEmpty)
-                    _buildPill(
-                      context,
-                      label: clientBucket!,
-                      icon: Icons.category,
-                      color: colorScheme.primary,
-                    ),
-                  if ((clientStatus ?? '').isNotEmpty)
-                    _buildPill(
-                      context,
-                      label: clientStatus!,
-                      icon: Icons.verified,
-                      color: AppColors.SECONDARY,
-                    ),
-                  if (isExtended == true)
-                    _buildPill(
-                      context,
-                      label: 'Extended',
-                      icon: Icons.timelapse,
-                      color: AppColors.WARNING,
-                    ),
-                  if (statementText != null)
-                    _buildPill(
-                      context,
-                      label: 'Stmt: $statementText',
-                      icon: Icons.calendar_today,
-                      color: AppColors.SECONDARY,
-                    ),
-                ],
-              ),
-            ],
-
             const SizedBox(height: 20),
-            const Divider(height: 1),
-
-            // Metrics
-            const SizedBox(height: 20),
-            LayoutBuilder(
-              builder: (context, constraints) {
-                final isWide = constraints.maxWidth > 400;
-                return isWide
-                    ? _buildWideMetrics(context, borrowedText, nextDueText, amountDueText, daysUntilDue, isOverdue)
-                    : _buildNarrowMetrics(context, borrowedText, nextDueText, amountDueText, daysUntilDue, isOverdue);
-              },
-            ),
-
-            // Client Balance Line
-            if (balText != null) ...[
-              const SizedBox(height: 20),
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: colorScheme.primary.withOpacity(0.05),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.account_balance_wallet,
-                      size: 20,
-                      color: colorScheme.primary,
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Account Balance',
-                            style: textTheme.bodySmall?.copyWith(
-                              color: AppColors.SECONDARY,
-                            ),
-                          ),
-                          Text(
-                            balText,
-                            style: textTheme.titleMedium?.copyWith(
-                              fontWeight: FontWeight.w800,
-                              color: colorScheme.primary,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-
-            // Actions (Manage removed)
-            const SizedBox(height: 24),
+            Divider(height: 1, color: Theme.of(context).dividerColor.withOpacity(0.7)),
+            const SizedBox(height: 18),
             Row(
               children: [
                 Expanded(
-                  child: FilledButton.icon(
-                    onPressed: onTopUp,
-                    icon: const Icon(Icons.add_circle, size: 18),
-                    label: const Text('Top Up'),
-                    style: FilledButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                    ),
+                  child: _simpleBalanceTile(
+                    context,
+                    label: 'Borrowed',
+                    value: borrowedText,
+                    icon: Icons.payments_outlined,
                   ),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: onBorrow,
-                    icon: const Icon(Icons.credit_score, size: 18),
-                    label: const Text('Borrow'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: colorScheme.primary,
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                    ),
+                  child: _simpleBalanceTile(
+                    context,
+                    label: 'Current Balance',
+                    value: balanceText,
+                    icon: Icons.account_balance_wallet_outlined,
                   ),
                 ),
               ],
             ),
+            const SizedBox(height: 18),
+            SizedBox(
+              height: 46,
+              child: FilledButton.icon(
+                onPressed: hasOutstandingBalance ? onTopUp : onBorrow,
+                icon: Icon(
+                  hasOutstandingBalance ? Icons.add_circle_outline : Icons.add,
+                  size: 18,
+                ),
+                label: Text(
+                  hasOutstandingBalance ? 'Apply / Top Up' : 'Apply for a Loan',
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+                style: FilledButton.styleFrom(
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+              ),
+            ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _simpleBalanceTile(
+    BuildContext context, {
+    required String label,
+    required String value,
+    required IconData icon,
+  }) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: colorScheme.primary.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: colorScheme.primary.withOpacity(0.10),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, size: 16, color: AppColors.SECONDARY),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  label,
+                  style: textTheme.bodySmall?.copyWith(
+                    color: AppColors.SECONDARY,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(
+              value,
+              style: textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1353,7 +1290,7 @@ class ClientDashboardCard extends StatelessWidget {
           isOverdue,
           Icons.calendar_today,
         ),
-        _metricColumn(context, 'Total Due', amountDueText, Icons.payment),
+        _metricColumn(context, 'Current Balance', amountDueText, Icons.payment),
       ],
     );
   }
@@ -1372,7 +1309,7 @@ class ClientDashboardCard extends StatelessWidget {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             _metricColumn(context, 'Borrowed', borrowedText, Icons.credit_card),
-            _metricColumn(context, 'Due', amountDueText, Icons.payment),
+            _metricColumn(context, 'Balance', amountDueText, Icons.payment),
           ],
         ),
         const SizedBox(height: 20),

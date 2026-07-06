@@ -5,13 +5,16 @@ import 'dart:convert';
 
 import 'package:daml/screens/admin/reports_screen.dart';
 import 'package:flutter/material.dart';
+import 'package:daml/widgets/app_skeleton.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:intl/intl.dart';
 
 import 'package:daml/theme/app_theme.dart';
+import 'package:daml/theme/app_colors.dart';
 import 'package:daml/services/sync_service.dart';
 import 'package:daml/services/api_service.dart';
 import 'package:daml/services/auth_service.dart';
+import 'package:daml/services/local_storage.dart';
 import 'package:daml/models/report_model.dart';
 
 // Screens used by the dashboard
@@ -22,6 +25,7 @@ import 'admin_profile_screen.dart';
 import 'edit_client_balances.dart';
 import 'package:daml/screens/client/widgets/home_widget.dart';
 import 'package:daml/screens/client/widgets/settings_screen.dart';
+import 'admin_submissions_widget.dart';
 
 class OverallAdminDashboard extends StatefulWidget {
   const OverallAdminDashboard({super.key});
@@ -43,6 +47,8 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
   // Client list state
   bool _loadingClients = true;
   List<Map<String, String>> _clients = [];
+  final TextEditingController _clientSearchController = TextEditingController();
+  String _clientSearch = '';
 
   // Reports state (loaded from ApiService)
   bool _loadingReports = true;
@@ -60,6 +66,7 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
 
   @override
   void dispose() {
+    _clientSearchController.dispose();
     try {
       _syncService.dispose();
     } catch (_) {}
@@ -202,7 +209,7 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
   void _showPendingActions() {
     showModalBottomSheet(
       context: context,
-      backgroundColor: const Color(0xFF1E1E1E),
+      backgroundColor: Theme.of(context).colorScheme.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
@@ -261,7 +268,7 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
                         Navigator.of(context).pop();
                         await _processPendingDeletions();
                       },
-                      style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+                      style: ElevatedButton.styleFrom(backgroundColor: AppColors.GREEN, foregroundColor: AppColors.BLACK),
                     ),
                   ),
                 ],
@@ -279,32 +286,37 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
     if (mounted) setState(() => _loadingClients = true);
 
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString('auth_users');
+      final rows = await ApiService.fetchClients(limit: 10000, lite: true);
 
-      if (raw == null || raw.isEmpty) {
-        _clients = [];
-      } else {
-        final decoded = json.decode(raw) as Map<String, dynamic>;
-        final list = <Map<String, String>>[];
-        decoded.forEach((email, data) {
-          final entry = data as Map<String, dynamic>;
-          final name = (entry['name'] as String?) ?? '';
-          list.add({'email': email, 'name': name});
-        });
+      final list = rows.map((row) {
+        final name = (row['fullName'] ?? row['name'] ?? '').toString().trim();
+        final email = (row['email'] ?? '').toString().trim().toLowerCase();
+        final phone = (row['phone'] ?? '').toString().trim();
 
-        list.sort((a, b) =>
-            (a['name']?.toLowerCase() ?? a['email']!).compareTo((b['name']?.toLowerCase() ?? b['email']!)));
+        return <String, String>{
+          'id': (row['_id'] ?? row['id'] ?? row['clientKey'] ?? '').toString(),
+          'name': name,
+          'email': email,
+          'phone': phone,
+        };
+      }).where((row) {
+        return row['name']!.isNotEmpty || row['email']!.isNotEmpty || row['phone']!.isNotEmpty;
+      }).toList();
 
-        _clients = list;
-      }
+      list.sort((a, b) {
+        final av = (a['name']!.isNotEmpty ? a['name']! : (a['email']!.isNotEmpty ? a['email']! : a['phone']!)).toLowerCase();
+        final bv = (b['name']!.isNotEmpty ? b['name']! : (b['email']!.isNotEmpty ? b['email']! : b['phone']!)).toLowerCase();
+        return av.compareTo(bv);
+      });
+
+      if (!mounted) return;
+      setState(() => _clients = list);
     } catch (e) {
-      _clients = [];
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to load clients: $e')),
-        );
-      }
+      if (!mounted) return;
+      setState(() => _clients = []);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to load clients from Supabase: $e')),
+      );
     } finally {
       if (mounted) setState(() => _loadingClients = false);
     }
@@ -357,11 +369,36 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
         _loadingReports = false;
       });
     } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _reportsError = e.toString();
-        _loadingReports = false;
-      });
+      try {
+        await LocalStorage.ensureInitialized();
+        final cached = LocalStorage.getAllReports()
+          ..sort((a, b) => b.date.compareTo(a.date));
+
+        if (!mounted) return;
+        setState(() {
+          _reports = cached;
+          _reportsError = cached.isEmpty
+              ? "You're currently offline. Connect to refresh cloud reports."
+              : null;
+          _loadingReports = false;
+        });
+
+        if (cached.isNotEmpty && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                "You're currently offline. Showing reports saved on this device.",
+              ),
+            ),
+          );
+        }
+      } catch (_) {
+        if (!mounted) return;
+        setState(() {
+          _reportsError = "You're currently offline. Connect to refresh cloud reports.";
+          _loadingReports = false;
+        });
+      }
     }
   }
 
@@ -434,6 +471,8 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
       preferredSize: const Size.fromHeight(100),
       child: HomeWidget(
         title: 'Admin Dashboard',
+        // This enables the bell to poll Supabase notifications for the overall admin.
+        notificationsEmail: AuthService.overallAdminEmail,
         onProfilePressed: () {
           Navigator.of(context).push(
             MaterialPageRoute(builder: (ctx) => const AdminProfileScreen()),
@@ -482,6 +521,7 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
         error: _reportsError,
         refreshReports: _loadReports,
       ),
+      const AdminSubmissionsWidget(),
       _buildClientsPage(),
     ];
 
@@ -491,7 +531,7 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
         appBar: preferredHeader,
         body: SafeArea(child: pages[_currentIndex]),
         bottomNavigationBar: _buildBottomNavBar(),
-        floatingActionButton: _currentIndex == 4
+        floatingActionButton: _currentIndex == 5
             ? FloatingActionButton.extended(
                 onPressed: _openBlankEditor,
                 icon: const Icon(Icons.edit),
@@ -503,50 +543,129 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
   }
 
   Widget _buildClientsPage() {
-    if (_loadingClients) return const Center(child: CircularProgressIndicator());
+    if (_loadingClients) return const AppPageSkeleton();
 
-    if (_clients.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('No registered clients'),
-            const SizedBox(height: 12),
-            ElevatedButton.icon(
-              icon: const Icon(Icons.person_add),
-              label: const Text('Add / Edit manually'),
-              onPressed: _openBlankEditor,
-            ),
-          ],
-        ),
-      );
-    }
+    final q = _clientSearch.trim().toLowerCase();
+    final filtered = q.isEmpty
+        ? _clients
+        : _clients.where((client) {
+            final haystack = [
+              client['name'] ?? '',
+              client['phone'] ?? '',
+              client['email'] ?? '',
+            ].join(' ').toLowerCase();
+            return haystack.contains(q);
+          }).toList();
 
     return RefreshIndicator(
       onRefresh: _loadClients,
-      child: ListView.separated(
+      child: ListView(
         padding: const EdgeInsets.all(12),
-        itemCount: _clients.length,
-        separatorBuilder: (_, __) => const SizedBox(height: 8),
-        itemBuilder: (c, i) {
-          final client = _clients[i];
-          final name = (client['name']?.isNotEmpty == true) ? client['name'] : client['email'];
-          final email = client['email']!;
-
-          return Card(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-            child: ListTile(
-              title: Text(name!),
-              subtitle: Text(email),
-              trailing: IconButton(
-                icon: const Icon(Icons.edit),
-                tooltip: 'Edit balances',
-                onPressed: () => _openEdit(email),
-              ),
-              onTap: () => _openEdit(email),
+        children: [
+          TextField(
+            controller: _clientSearchController,
+            onChanged: (value) => setState(() => _clientSearch = value),
+            decoration: InputDecoration(
+              hintText: 'Search name, phone or email',
+              prefixIcon: const Icon(Icons.search),
+              suffixIcon: _clientSearch.isEmpty
+                  ? null
+                  : IconButton(
+                      tooltip: 'Clear search',
+                      icon: const Icon(Icons.clear),
+                      onPressed: () {
+                        _clientSearchController.clear();
+                        setState(() => _clientSearch = '');
+                      },
+                    ),
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
             ),
-          );
-        },
+          ),
+          const SizedBox(height: 10),
+          Text(
+            '${filtered.length} client${filtered.length == 1 ? '' : 's'}',
+            style: TextStyle(color: Colors.grey[400], fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 10),
+          if (filtered.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 48),
+              child: Center(
+                child: Text(
+                  q.isEmpty ? 'No clients found in Supabase' : 'No client matches your search',
+                  style: TextStyle(color: Colors.grey[400]),
+                ),
+              ),
+            )
+          else
+            ...filtered.map((client) {
+              final name = (client['name'] ?? '').trim();
+              final email = (client['email'] ?? '').trim();
+              final phone = (client['phone'] ?? '').trim();
+              final displayName = name.isNotEmpty
+                  ? name
+                  : (email.isNotEmpty ? email : (phone.isNotEmpty ? phone : 'Unnamed client'));
+
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Card(
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: ListTile(
+                      leading: CircleAvatar(
+                        child: Text(
+                          displayName.isNotEmpty ? displayName.substring(0, 1).toUpperCase() : '?',
+                        ),
+                      ),
+                      title: Text(
+                        displayName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                      subtitle: Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (phone.isNotEmpty)
+                              Row(
+                                children: [
+                                  const Icon(Icons.phone_outlined, size: 15),
+                                  const SizedBox(width: 6),
+                                  Expanded(child: Text(phone, overflow: TextOverflow.ellipsis)),
+                                ],
+                              ),
+                            if (phone.isNotEmpty && email.isNotEmpty) const SizedBox(height: 4),
+                            if (email.isNotEmpty)
+                              Row(
+                                children: [
+                                  const Icon(Icons.email_outlined, size: 15),
+                                  const SizedBox(width: 6),
+                                  Expanded(child: Text(email, overflow: TextOverflow.ellipsis)),
+                                ],
+                              ),
+                            if (phone.isEmpty && email.isEmpty)
+                              Text('No phone or email in the database', style: TextStyle(color: Colors.grey[500])),
+                          ],
+                        ),
+                      ),
+                      trailing: email.isEmpty
+                          ? null
+                          : IconButton(
+                              icon: const Icon(Icons.edit),
+                              tooltip: 'Edit balances',
+                              onPressed: () => _openEdit(email),
+                            ),
+                      onTap: email.isEmpty ? null : () => _openEdit(email),
+                    ),
+                  ),
+                ),
+              );
+            }),
+          const SizedBox(height: 88),
+        ],
       ),
     );
   }
@@ -554,10 +673,10 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
   Widget _buildBottomNavBar() {
     return Container(
       decoration: BoxDecoration(
-        color: const Color(0xFF1E1E1E),
+        color: AppColors.INK,
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.4),
+            color: Colors.black.withOpacity(0.18),
             blurRadius: 10,
             offset: const Offset(0, -2),
           ),
@@ -565,9 +684,10 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
       ),
       child: BottomNavigationBar(
         currentIndex: _currentIndex,
-        backgroundColor: const Color(0xFF1E1E1E),
-        selectedItemColor: Colors.blueAccent,
-        unselectedItemColor: Colors.grey[600],
+        type: BottomNavigationBarType.fixed,
+        backgroundColor: AppColors.INK,
+        selectedItemColor: AppColors.GREEN,
+        unselectedItemColor: AppColors.GRAY_500,
         showUnselectedLabels: true,
         onTap: (i) => setState(() => _currentIndex = i),
         items: const [
@@ -575,6 +695,7 @@ class _OverallAdminDashboardState extends State<OverallAdminDashboard> {
           BottomNavigationBarItem(icon: Icon(Icons.account_tree), label: "Branches"),
           BottomNavigationBarItem(icon: Icon(Icons.calendar_view_month), label: "Monthly"),
           BottomNavigationBarItem(icon: Icon(Icons.list_alt), label: "Reports"),
+          BottomNavigationBarItem(icon: Icon(Icons.assignment), label: "Applications"),
           BottomNavigationBarItem(icon: Icon(Icons.person), label: "Clients"),
         ],
       ),

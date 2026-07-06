@@ -15,6 +15,7 @@ import 'package:intl/intl.dart';
 import 'package:daml/models/report_model.dart';
 import 'package:daml/services/local_storage.dart';
 import 'package:daml/services/api_service.dart';
+import 'package:daml/services/remote_storage.dart';
 
 class DailyFormScreen extends StatefulWidget {
   final String branchName;
@@ -525,7 +526,7 @@ class _DailyFormScreenState extends State<DailyFormScreen> {
         'totalLoans': report.totalLoans,
       };
 
-      await ApiService.saveReportSingle(payload);
+      final syncedToCloud = await RemoteStorage.saveReport(report);
 
       if (commentText.isNotEmpty) {
         try {
@@ -535,7 +536,7 @@ class _DailyFormScreenState extends State<DailyFormScreen> {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text('Saved report but failed to save comment: $e'),
+                content: const Text('The report was saved. The comment could not be synced yet.'),
                 backgroundColor: Colors.orange,
               ),
             );
@@ -557,7 +558,7 @@ class _DailyFormScreenState extends State<DailyFormScreen> {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text('Saved report but failed to save collected-for comment: $e'),
+                content: const Text('The report was saved. One note could not be synced yet.'),
                 backgroundColor: Colors.orange,
               ),
             );
@@ -568,17 +569,21 @@ class _DailyFormScreenState extends State<DailyFormScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: const Text('Report saved to server'),
+          content: Text(
+            syncedToCloud
+                ? 'Daily report saved and synced.'
+                : "You're currently offline. The report is saved safely and will sync automatically.",
+          ),
           backgroundColor: Theme.of(context).colorScheme.primary,
         ),
       );
       if (mounted) Navigator.of(context).pop(true);
     } catch (serverErr) {
-      debugPrint('Server save failed: $serverErr');
+      debugPrint('Report save failed: $serverErr');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Failed to save report to server: $serverErr'),
+          content: const Text('Could not save the report. Please try again.'),
           backgroundColor: Colors.red,
         ),
       );

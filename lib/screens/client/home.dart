@@ -9,6 +9,7 @@ import 'package:daml/screens/client/widgets/client_dashboard.dart';
 import 'package:daml/screens/client/widgets/loan_calculator.dart';
 import 'package:daml/theme/app_colors.dart';
 import 'package:flutter/material.dart';
+import 'package:daml/widgets/app_skeleton.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
@@ -213,7 +214,7 @@ class _ClientHomeScreenState extends State<ClientHomeScreen> {
 
       // show loading indicator while initial load happening
       if (isLoading && (displayName == 'Guest User' || displayEmail == 'you@example.com')) {
-        return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        return const Scaffold(body: AppPageSkeleton());
       }
 
       return Scaffold(
@@ -223,7 +224,9 @@ class _ClientHomeScreenState extends State<ClientHomeScreen> {
             // by ClientDataNotifier.loadClientData(). We pass callbacks for profile/settings.
             HomeWidget(
               title: 'Welcome, ${displayName.split(' ').first}',
-              onSettingsPressed: _openSettings, onProfilePressed: () {  },
+              notificationsEmail: displayEmail == 'you@example.com' ? null : displayEmail,
+              onSettingsPressed: _openSettings,
+              onProfilePressed: () {  },
             ),
 
             // Scrollable area with dashboard first then client details below
@@ -250,21 +253,6 @@ class _ClientHomeScreenState extends State<ClientHomeScreen> {
                       currency: '', loanCount: 0, actualBalance: null, isCleared: null,
                     ),
 
-                    const SizedBox(height: 12),
-
-                    BalanceV2(
-                      balanceAmount: actualBalance,
-                      isBalanceHidden: _isBalanceHidden,
-                      onToggleVisibility: _toggleBalanceVisibility,
-                      nextPaymentAmount: nextPaymentAmount ?? 0.0,
-                      nextPaymentDate: nextPaymentDate,
-                      onPayNow: _onPayNow,
-                      onViewSchedule: _onViewSchedule,
-                      billingCycleDays: 30,
-                    ),
-
-                    const SizedBox(height: 24),
-
                     const SizedBox(height: 24),
                   ],
                 ),
@@ -273,12 +261,6 @@ class _ClientHomeScreenState extends State<ClientHomeScreen> {
           ],
         ),
 
-        floatingActionButton: FloatingActionButton(
-          onPressed: _openLoanCalculator,
-          tooltip: 'Loan Calculator',
-          backgroundColor: Theme.of(context).colorScheme.primary,
-          child: const Icon(Icons.calculate),
-        ),
       );
     });
   }

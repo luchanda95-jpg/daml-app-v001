@@ -5,6 +5,7 @@
 
 import 'package:daml/models/monthly_report_model.dart';
 import 'package:daml/services/api_service.dart';
+import 'package:daml/services/sync_service.dart';
 import 'package:flutter/foundation.dart'; // kDebugMode
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -299,13 +300,13 @@ class _MonthlyFormScreenState extends State<MonthlyFormScreen> {
   }
 
   String _cleanServerMessage(dynamic result) {
-    if (result is! Map) return 'Monthly report saved to server';
+    if (result is! Map) return 'Monthly report saved.';
 
     final raw = (result['message'] ?? '').toString().trim();
     final lower = raw.toLowerCase();
 
-    if (raw.isEmpty) return 'Monthly report saved to server';
-    if (lower.contains('ui only')) return 'Monthly report saved to server';
+    if (raw.isEmpty) return 'Monthly report saved.';
+    if (lower.contains('ui only')) return 'Monthly report saved.';
 
     return raw;
   }
@@ -369,11 +370,14 @@ class _MonthlyFormScreenState extends State<MonthlyFormScreen> {
         'createdAt': DateTime.now().toUtc().toIso8601String(),
       };
 
-      final result = await ApiService.syncMonthlyReports([payload]);
-
-      if (result['success'] == false) {
-        throw Exception('Server rejected request: $result');
-      }
+      final report = MonthlyReport.fromJson(payload);
+      final syncedToCloud = await SyncService().pushMonthlyReport(report);
+      final result = <String, dynamic>{
+        'success': true,
+        'message': syncedToCloud
+            ? 'Monthly report saved and synced.'
+            : "You're currently offline. The monthly report is saved safely and will sync automatically.",
+      };
 
       // ✅ SEND NOTIFICATION TO OVERALL ADMIN
       try {
@@ -400,7 +404,7 @@ class _MonthlyFormScreenState extends State<MonthlyFormScreen> {
       debugPrint('Monthly save failed: $e');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to save monthly report: $e')),
+        const SnackBar(content: Text('Could not save the monthly report. Please try again.')),
       );
     } finally {
       if (mounted) setState(() => _isSaving = false);

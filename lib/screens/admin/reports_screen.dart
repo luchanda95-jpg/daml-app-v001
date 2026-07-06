@@ -3,7 +3,9 @@
 
 import 'package:daml/screens/branch/report_detail_screen.dart';
 import 'package:flutter/material.dart';
+import 'package:daml/widgets/app_skeleton.dart';
 import 'package:intl/intl.dart';
+import 'package:daml/theme/app_colors.dart';
 
 import 'package:daml/models/report_model.dart';
 
@@ -39,7 +41,7 @@ class ReportsScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (loading) {
-      return const Center(child: CircularProgressIndicator());
+      return const AppPageSkeleton();
     }
     if (error != null && error!.isNotEmpty) {
       return Center(
@@ -83,11 +85,11 @@ class ReportsScreen extends StatelessWidget {
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       margin: const EdgeInsets.only(bottom: 12),
       child: ListTile(
-        leading: const Icon(Icons.receipt_long, color: Colors.blueAccent),
+        leading: const Icon(Icons.receipt_long, color: AppColors.GREEN),
         title: Text(rep.branch, style: const TextStyle(fontWeight: FontWeight.bold)),
         subtitle: Text(DateFormat.yMMMd().format(rep.date)),
         trailing: Text(currency.format(rep.totalCollected ?? 0),
-            style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
+            style: const TextStyle(color: AppColors.GREEN_DARK, fontWeight: FontWeight.bold)),
         onTap: () {
           Navigator.push(
             context,

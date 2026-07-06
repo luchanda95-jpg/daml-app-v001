@@ -9,6 +9,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:daml/widgets/app_skeleton.dart';
 import 'package:intl/intl.dart';
 import 'package:flutter_speed_dial/flutter_speed_dial.dart';
 
@@ -29,6 +30,7 @@ import 'package:daml/screens/branch/zanaco_distribution_screen.dart';
 
 import 'package:daml/services/api_service.dart';
 import 'package:daml/services/auth_service.dart';
+import 'package:daml/services/local_storage.dart';
 
 enum ReportsViewMode { both, daily, monthly }
 
@@ -296,11 +298,45 @@ class _BranchAdminHomeScreenState extends State<BranchAdminHomeScreen> {
       // ✅ Fetch Zanaco received totals for today (includes self allocations)
       await _fetchZanacoTodayReceived();
     } catch (e) {
-      if (kDebugMode) debugPrint('Failed fetching reports: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed loading reports: ${e.toString()}')),
-        );
+      if (kDebugMode) debugPrint('Cloud report fetch failed; using local cache: $e');
+
+      try {
+        await LocalStorage.ensureInitialized();
+        final branchNorm = _branchKey.isNotEmpty ? _branchKey : _normBranch(widget.branchName);
+
+        final cachedDaily = LocalStorage.getAllReports()
+            .where((r) => _normBranch(r.branch) == branchNorm)
+            .toList()
+          ..sort((a, b) => b.date.compareTo(a.date));
+
+        final cachedMonthly = LocalStorage.getAllMonthlyReports()
+            .where((r) => _normBranch(r.branch) == branchNorm)
+            .toList()
+          ..sort((a, b) => b.date.compareTo(a.date));
+
+        _dailyNotifier.value = List<DailyReport>.from(cachedDaily);
+        _monthlyNotifier.value = List<MonthlyReport>.from(cachedMonthly);
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                "You're currently offline. Showing reports saved on this device.",
+              ),
+            ),
+          );
+        }
+      } catch (cacheError) {
+        if (kDebugMode) debugPrint('Local report cache failed: $cacheError');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                "You're currently offline. Connect to refresh your reports.",
+              ),
+            ),
+          );
+        }
       }
     } finally {
       if (mounted) {
@@ -538,7 +574,7 @@ class _BranchAdminHomeScreenState extends State<BranchAdminHomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    if (_loading) return const Scaffold(body: AppPageSkeleton());
 
     final cs = Theme.of(context).colorScheme;
     final onSurface = cs.onSurface;

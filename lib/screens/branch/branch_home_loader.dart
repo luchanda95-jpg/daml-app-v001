@@ -1,5 +1,6 @@
 // lib/screens/branch/branch_home_loader.dart
 import 'package:flutter/material.dart';
+import 'package:daml/widgets/app_skeleton.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../services/auth_service.dart';
@@ -111,7 +112,7 @@ class _BranchHomeLoaderState extends State<BranchHomeLoader> {
     }
 
     if (_branchName == null) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return const Scaffold(body: AppPageSkeleton());
     }
 
     return BranchAdminHomeScreen(branchName: _branchName!);

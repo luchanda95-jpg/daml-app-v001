@@ -1,8 +1,7 @@
 // lib/screens/branch/widgets/branch_summery.dart
-// Branch summary widget (uses only public ApiService methods)
+// Branch summary widget (Supabase data via ApiService compatibility facade)
 //
-// Robust zanaco totals fetcher: tries ApiService.getZanaco, falls back to
-// ApiService.fetchZanacoDistributions. Tolerant parsing of many payload shapes.
+// Robust Zanaco totals fetcher using direct Supabase-backed methods.
 
 // ignore_for_file: deprecated_member_use, curly_braces_in_flow_structures
 
@@ -149,7 +148,7 @@ class _BranchSummaryWidgetState extends State<BranchSummaryWidget> {
 
       final date = widget.dateForZanacoLookup ?? DateTime.now();
 
-      debugPrint('[BranchSummary] requesting zanaco for $branchQuery on $date (base=${ApiService.baseUrl})');
+      debugPrint('[BranchSummary] requesting Supabase Zanaco data for $branchQuery on $date');
 
       dynamic resp;
       // Try the "getZanaco" friendly endpoint first (often present)

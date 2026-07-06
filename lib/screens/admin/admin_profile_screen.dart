@@ -1,6 +1,7 @@
 // ignore_for_file: unintended_html_in_doc_comment
 
 import 'package:flutter/material.dart';
+import 'package:daml/widgets/app_skeleton.dart';
 
 class AdminProfileScreen extends StatefulWidget {
   /// Optional initial profile provided by the parent.
@@ -73,7 +74,7 @@ class _AdminProfileScreenState extends State<AdminProfileScreen> {
         ],
       ),
       body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
+          ? const AppPageSkeleton(cards: 3)
           : ListView(
               padding: const EdgeInsets.all(16.0),
               children: [

@@ -1,5 +1,5 @@
 // lib/screens/branch/monthly_report_detail_screen.dart
-// Monthly Report detail — REAL delete via server (/monthly_reports or /monthly_reports/:id)
+// Monthly Report detail — delete directly from Supabase
 
 // ignore_for_file: use_build_context_synchronously, deprecated_member_use
 

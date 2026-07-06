@@ -1,7 +1,7 @@
 // lib/services/auth_service.dart
-// Remote-first AuthService with SharedPreferences fallback (local user store + balances).
-// Uses ApiClient for remote auth/health only.
-// UPDATED: Now syncs tokens with ApiService for cross-service compatibility
+// Supabase-first AuthService for DAML.
+// Authentication is handled only by Supabase Auth.
+// SharedPreferences is used only for local session/profile cache and offline UI state.
 
 // ignore_for_file: curly_braces_in_flow_control_structures, unintended_html_in_doc_comment
 
@@ -9,11 +9,10 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
-import 'api_client.dart';
-import 'api_service.dart'; // Added import for ApiService
+import 'supabase_daml_service.dart';
 
 class AuthService {
   AuthService._();
@@ -37,24 +36,94 @@ class AuthService {
   static const String branchAdminPassword = 'admin';
   static const String overallAdminPassword = 'ovadmin';
 
-  // Key for persisted users (clients)
-  static const String _kUsersKey = 'auth_users';
-  static const String _kAdminSubmissionsKey = 'admin_submissions';
+  static bool _isReservedAdminEmail(String normalized) {
+    return normalized == overallAdminEmail || branchAdminEmails.contains(normalized);
+  }
 
-  // Remote API base (set to your base)
-  // NOTE: no trailing slash required; ApiClient will normalize.
-  static String? apiBase = 'https://directaccessapi.onrender.com';
 
-  // Api client instance (created on demand)
-  static ApiClient get _apiClient => ApiClient(baseUrl: apiBase ?? '', client: http.Client());
+  static String _roleForReservedEmail(String normalized) {
+    if (normalized == overallAdminEmail) return 'ovadmin';
+    if (branchAdminEmails.contains(normalized)) return 'branch_admin';
+    return 'client';
+  }
 
-  // Small timeouts / checks
-  static Future<bool> _serverAvailable() async {
-    if (apiBase == null) return false;
+  static String _branchForEmail(String normalized) {
+    if (!branchAdminEmails.contains(normalized)) return '';
+    return normalized.split('@').first.trim().toLowerCase();
+  }
+
+  static Future<String?> _storeSupabaseSession(AuthResponse res, String normalized) async {
+    final session = res.session;
+    final user = res.user;
+    if (session == null || user == null) return null;
+
+    final metadata = user.userMetadata ?? <String, dynamic>{};
+    final reservedRole = _roleForReservedEmail(normalized);
+    final branch = (metadata['branch'] ?? _branchForEmail(normalized)).toString();
+    final role = (_isReservedAdminEmail(normalized) ? reservedRole : (metadata['role'] ?? reservedRole)).toString();
+    final name = (metadata['full_name'] ?? metadata['name'] ??
+            (normalized == overallAdminEmail
+                ? 'Overall Admin'
+                : (branchAdminEmails.contains(normalized) ? '${branch.toUpperCase()} Branch' : '')))
+        .toString();
+    final phone = (metadata['phone'] ?? '').toString();
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('auth_token', session.accessToken);
+    await prefs.setString('auth_email', normalized);
+    await prefs.setString('auth_role', role);
+    await prefs.setString('auth_name', name);
+    await prefs.setString('auth_phone', phone);
+    if (branch.isNotEmpty) await prefs.setString('auth_branch', branch);
+
+    await SupabaseDamlService.upsertProfile(
+      name: name,
+      email: normalized,
+      phone: phone,
+      role: role,
+      branch: branch,
+    );
+    await syncTokenToApiService();
+    return session.accessToken;
+  }
+
+  static Future<String?> _trySupabaseSignIn(String normalized, String password) async {
+    if (!SupabaseDamlService.isConfigured) return null;
+
     try {
-      return await _apiClient.healthcheck();
-    } catch (_) {
-      return false;
+      final res = await SupabaseDamlService.signIn(email: normalized, password: password);
+      return await _storeSupabaseSession(res, normalized);
+    } catch (e) {
+      if (kDebugMode) print('Supabase sign-in failed: $e');
+
+      // Reserved admin accounts are auto-provisioned in Supabase on first login.
+      // This gives overall and branch admins a real Supabase Auth session so RLS
+      // can safely allow direct report reads/writes without exposing a service key.
+      final validReservedCredentials =
+          (normalized == overallAdminEmail && password == overallAdminPassword) ||
+          (branchAdminEmails.contains(normalized) && password == branchAdminPassword);
+      if (validReservedCredentials) {
+        try {
+          final role = _roleForReservedEmail(normalized);
+          final branch = _branchForEmail(normalized);
+          final displayName = normalized == overallAdminEmail
+              ? 'Overall Admin'
+              : '${branch.toUpperCase()} Branch';
+          final res = await SupabaseDamlService.client.auth.signUp(
+            email: normalized,
+            password: password,
+            data: {
+              'full_name': displayName,
+              'role': role,
+              if (branch.isNotEmpty) 'branch': branch,
+            },
+          );
+          return await _storeSupabaseSession(res, normalized);
+        } catch (signUpError) {
+          if (kDebugMode) print('Supabase reserved admin auto-provision failed: $signUpError');
+        }
+      }
+      return null;
     }
   }
 
@@ -63,161 +132,43 @@ class AuthService {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getString('auth_branch');
   }
-
-  // ============ SOLUTION 1: TOKEN SYNC WITH API SERVICE ============
-
-  /// Sync the current auth token to ApiService
+  // Compatibility method kept because older widgets still call it.
+  // Supabase Auth owns the real session, so there is no external API token to sync.
   static Future<void> syncTokenToApiService() async {
-    final token = await getToken();
-    if (token != null && token.isNotEmpty) {
-      ApiService.setAuthToken(token);
-      if (kDebugMode) {
-        final shortToken = token.length > 20 ? '${token.substring(0, 20)}...' : token;
-        print('[AuthService] Token synced to ApiService: $shortToken');
-      }
-    } else {
-      ApiService.clearAuthToken();
-      if (kDebugMode) {
-        print('[AuthService] No token found, cleared ApiService auth');
-      }
-    }
+    await SupabaseDamlService.ensureReady();
   }
 
-  /// Manually trigger token sync (useful for app initialization)
   static Future<void> ensureApiServiceToken() async {
-    await syncTokenToApiService();
+    await SupabaseDamlService.ensureReady();
   }
 
-  // ------------ local users helpers -------------
-  static Future<Map<String, dynamic>> _loadUsers() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_kUsersKey);
-    if (raw == null || raw.isEmpty) return {};
-    try {
-      final decoded = json.decode(raw);
-      if (decoded is Map) return Map<String, dynamic>.from(decoded);
-      return {};
-    } catch (_) {
-      return {};
-    }
-  }
-
-  static Future<void> _saveUsers(Map<String, dynamic> users) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kUsersKey, json.encode(users));
-  }
-
-  // local sign-in logic
-  static Future<String> _signInLocal(String normalized, String password) async {
-    // Reserved overall admin
-    if (normalized == overallAdminEmail) {
-      if (password == overallAdminPassword) {
-        final token = 'ovadmin-token-${DateTime.now().millisecondsSinceEpoch}';
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString('auth_token', token);
-        await prefs.setString('auth_email', normalized);
-        await prefs.setString('auth_role', 'ovadmin');
-        return token;
-      } else {
-        throw Exception('Invalid credentials');
-      }
-    }
-
-    // Branch admin
-    if (branchAdminEmails.contains(normalized)) {
-      if (password == branchAdminPassword) {
-        final token = 'branch-token-${DateTime.now().millisecondsSinceEpoch}';
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString('auth_token', token);
-        await prefs.setString('auth_email', normalized);
-        await prefs.setString('auth_role', 'branch_admin');
-        return token;
-      } else {
-        throw Exception('Invalid credentials');
-      }
-    }
-
-    // Persisted client users
-    final users = await _loadUsers();
-    if (users.containsKey(normalized)) {
-      final dynamicEntry = users[normalized];
-      if (dynamicEntry is Map) {
-        final entry = Map<String, dynamic>.from(dynamicEntry);
-        if (entry['password'] == password) {
-          final role = entry['role'] as String? ?? 'client';
-          final token = 'client-token-${DateTime.now().millisecondsSinceEpoch}';
-          final prefs = await SharedPreferences.getInstance();
-          await prefs.setString('auth_token', token);
-          await prefs.setString('auth_email', normalized);
-          await prefs.setString('auth_role', role);
-          await prefs.setString('auth_name', (entry['name'] ?? '').toString());
-          await prefs.setString('auth_phone', (entry['phone'] ?? '').toString());
-          return token;
-        }
-      }
-    }
-
-    throw Exception('Invalid credentials');
-  }
-
-  // ---------- Utility: read persisted (local) registered users ----------
-  /// Returns a map keyed by normalized email -> user entry (Map<String,dynamic>).
-  static Future<Map<String, Map<String, dynamic>>> getAllLocalUsers() async {
-    final users = await _loadUsers();
-    final out = <String, Map<String, dynamic>>{};
-    users.forEach((email, entry) {
-      if (entry is Map) out[email.toString()] = Map<String, dynamic>.from(entry);
-    });
-    return out;
-  }
-
-  /// Returns a simple List of user summaries suitable for UI display.
-  /// Each element contains keys: 'email', 'name', 'phone', 'role'.
-  static Future<List<Map<String, String>>> getRegisteredUsersList() async {
-    final raw = await getAllLocalUsers();
-    final out = <Map<String, String>>[];
-    raw.forEach((email, entry) {
-      out.add({
-        'email': email,
-        'name': (entry['name'] ?? '').toString(),
-        'phone': (entry['phone'] ?? '').toString(),
-        'role': (entry['role'] ?? 'client').toString(),
-      });
-    });
-    return out;
-  }
-
-  // ---------- Sign in (remote-first, fallback to local) ----------
+  // ---------- Sign in (Supabase only) ----------
   static Future<String> signInWithEmail(String email, String password) async {
-    await Future.delayed(const Duration(milliseconds: 300));
     final normalized = email.toLowerCase().trim();
 
-    if (await _serverAvailable()) {
-      try {
-        // ApiClient.login returns a User model which includes token & email
-        final user = await _apiClient.login(normalized, password);
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString('auth_token', user.token);
-        await prefs.setString('auth_email', user.email.toLowerCase().trim());
-        await prefs.setString('auth_role', user.role);
-        await prefs.setString('auth_name', user.name);
-        await prefs.setString('auth_phone', user.phone);
-
-        await syncTokenToApiService();
-        return user.token;
-      } catch (e) {
-        if (kDebugMode) print('Remote login failed, falling back locally: $e');
-      }
+    if (!SupabaseDamlService.isConfigured) {
+      throw Exception(
+        'Supabase is not configured. Check the project URL and public key.',
+      );
     }
 
-    final token = await _signInLocal(normalized, password);
-    await syncTokenToApiService();
-    return token;
+    final supabaseToken = await _trySupabaseSignIn(normalized, password);
+    if (supabaseToken == null || supabaseToken.isEmpty) {
+      throw Exception(
+        'Unable to sign in. Check your email, password, and internet connection.',
+      );
+    }
+
+    return supabaseToken;
   }
 
-  // ---------- Register (remote-first, fallback to local) ----------
-  static Future<String> registerWithEmail(String name, String email, String phone, String password) async {
-    await Future.delayed(const Duration(milliseconds: 400));
+  // ---------- Register (Supabase only) ----------
+  static Future<String> registerWithEmail(
+    String name,
+    String email,
+    String phone,
+    String password,
+  ) async {
     final normalized = email.toLowerCase().trim();
 
     if (normalized.isEmpty || password.length < 6) {
@@ -225,39 +176,39 @@ class AuthService {
     }
 
     if (normalized == overallAdminEmail || branchAdminEmails.contains(normalized)) {
-      throw Exception('This email is reserved for admin accounts and cannot be registered here.');
+      throw Exception(
+        'This email is reserved for admin accounts and cannot be registered here.',
+      );
     }
 
-    if (await _serverAvailable()) {
-      try {
-        // ApiClient.register returns a User model (token included)
-        final user = await _apiClient.register(name, normalized, phone, password);
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString('auth_token', user.token);
-        await prefs.setString('auth_email', user.email.toLowerCase().trim());
-        await prefs.setString('auth_role', user.role);
-        await prefs.setString('auth_name', user.name);
-        await prefs.setString('auth_phone', user.phone);
-
-        await syncTokenToApiService();
-        return user.token;
-      } catch (e) {
-        if (kDebugMode) print('Remote register failed, falling back locally: $e');
-      }
+    if (!SupabaseDamlService.isConfigured) {
+      throw Exception(
+        'Supabase is not configured. Check the project URL and public key.',
+      );
     }
 
-    final users = await _loadUsers();
-    if (users.containsKey(normalized)) throw Exception('Email already registered');
+    final res = await SupabaseDamlService.signUp(
+      name: name,
+      email: normalized,
+      phone: phone,
+      password: password,
+    );
 
-    users[normalized] = <String, dynamic>{
-      'password': password,
-      'role': 'client',
-      'name': name,
-      'phone': phone,
-    };
-    await _saveUsers(users);
+    final session = res.session;
+    final user = res.user;
 
-    final token = 'client-token-registered-${Random().nextInt(999999)}';
+    if (user == null) {
+      throw Exception('Supabase registration failed');
+    }
+
+    if (session == null) {
+      throw Exception(
+        'Account created, but email confirmation is required. '
+        'Please confirm your email before signing in.',
+      );
+    }
+
+    final token = session.accessToken;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('auth_token', token);
     await prefs.setString('auth_email', normalized);
@@ -265,7 +216,6 @@ class AuthService {
     await prefs.setString('auth_name', name);
     await prefs.setString('auth_phone', phone);
 
-    await syncTokenToApiService();
     return token;
   }
 
@@ -306,17 +256,34 @@ class AuthService {
     await prefs.remove('auth_role');
     await prefs.remove('auth_name');
     await prefs.remove('auth_phone');
+    await prefs.remove('auth_branch');
 
-    ApiService.clearAuthToken();
+    await SupabaseDamlService.signOut();
   }
-
   static Future<bool> isSignedIn() async {
+    if (!SupabaseDamlService.isConfigured) return false;
+
+    await SupabaseDamlService.ensureReady();
+    final session = SupabaseDamlService.client.auth.currentSession;
+
+    if (session != null) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('auth_token', session.accessToken);
+      return true;
+    }
+
     final prefs = await SharedPreferences.getInstance();
-    final token = prefs.getString('auth_token');
-    return token != null && token.trim().isNotEmpty;
+    await prefs.remove('auth_token');
+    return false;
   }
 
   static Future<String?> getToken() async {
+    if (SupabaseDamlService.isConfigured) {
+      await SupabaseDamlService.ensureReady();
+      final token = SupabaseDamlService.client.auth.currentSession?.accessToken;
+      if (token != null && token.isNotEmpty) return token;
+    }
+
     final prefs = await SharedPreferences.getInstance();
     return prefs.getString('auth_token');
   }
@@ -616,62 +583,10 @@ class AuthService {
       print('║ Role: ${role ?? "Not set"}');
       print('║ Name: ${name ?? "Not set"}');
       print('║ Phone: ${phone ?? "Not set"}');
-      print('║ ApiService auth header: ${ApiService.defaultHeaders.containsKey('Authorization')}');
 
       final signedIn = await isSignedIn();
       print('║ AuthService.isSignedIn(): $signedIn');
       print('╚═══════════════════════════════════════════╝');
     }
-  }
-
-  // ---------- Admin submissions (LOCAL ONLY) ----------
-  static Future<void> addAdminSubmission(Map<String, dynamic> submission) async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_kAdminSubmissionsKey) ?? '[]';
-
-    List<dynamic> list;
-    try {
-      final decoded = json.decode(raw);
-      list = decoded is List ? decoded : <dynamic>[];
-    } catch (_) {
-      list = <dynamic>[];
-    }
-
-    list.insert(0, submission);
-    await prefs.setString(_kAdminSubmissionsKey, json.encode(list));
-  }
-
-  static Future<List<Map<String, dynamic>>> getAdminSubmissions() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_kAdminSubmissionsKey) ?? '[]';
-
-    try {
-      final decoded = json.decode(raw);
-      if (decoded is List) {
-        final out = <Map<String, dynamic>>[];
-        for (final e in decoded) {
-          if (e is Map) out.add(Map<String, dynamic>.from(e));
-        }
-        return out;
-      }
-    } catch (_) {}
-
-    return <Map<String, dynamic>>[];
-  }
-
-  static Future<void> removeAdminSubmissionById(String id) async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_kAdminSubmissionsKey) ?? '[]';
-
-    List<dynamic> list;
-    try {
-      final decoded = json.decode(raw);
-      list = decoded is List ? decoded : <dynamic>[];
-    } catch (_) {
-      list = <dynamic>[];
-    }
-
-    list.removeWhere((e) => e is Map && e['id']?.toString() == id);
-    await prefs.setString(_kAdminSubmissionsKey, json.encode(list));
   }
 }

@@ -9,7 +9,7 @@ import 'package:daml/models/report_model.dart'; // DailyReport
 import 'package:daml/models/monthly_report_model.dart'; // MonthlyReport
 import 'package:daml/services/api_service.dart';
 
-/// RemoteStorage: tries server first, falls back to local Hive cache.
+/// RemoteStorage: writes to Supabase when online and keeps Hive as the offline queue/cache.
 /// Keeps a small API compatible with your existing LocalStorage usage.
 class RemoteStorage {
   static const _reportsBox = 'reports';
@@ -43,14 +43,22 @@ class RemoteStorage {
     return '${branch.trim().toLowerCase()}::${norm.toIso8601String()}';
   }
 
+
+  static bool _isOfflineResult(dynamic result) {
+    if (result is Iterable) {
+      return result.isEmpty || result.every((e) => e == ConnectivityResult.none);
+    }
+    return result == ConnectivityResult.none;
+  }
+
   // ---------------- DAILY REPORTS ----------------
 
   /// Save report: try server upsert; if succeeds mark local copy as synced; else save locally as unsynced
-  static Future<void> saveReport(DailyReport report) async {
+  static Future<bool> saveReport(DailyReport report) async {
     await ensureInitialized();
     try {
       final conn = await Connectivity().checkConnectivity();
-      if (conn != ConnectivityResult.none) {
+      if (!_isOfflineResult(conn)) {
         // Convert to plain map expected by server
         final rmap = report.toMap();
         try {
@@ -59,9 +67,9 @@ class RemoteStorage {
           final synced = report.copyWith(synced: true);
           final box = Hive.box<DailyReport>(_reportsBox);
           await box.put(_keyFor(report.branch, report.date), synced);
-          return;
+          return true;
         } catch (e) {
-          debugPrint('RemoteStorage.saveReport: server upsert failed, falling back to local: $e');
+          debugPrint('RemoteStorage.saveReport: Supabase save failed, keeping local copy: $e');
         }
       } else {
         debugPrint('RemoteStorage.saveReport: no connectivity - saving locally');
@@ -75,6 +83,7 @@ class RemoteStorage {
       final box = Hive.box<DailyReport>(_reportsBox);
       final unsynced = report.copyWith(synced: false);
       await box.put(_keyFor(report.branch, report.date), unsynced);
+      return false;
     } catch (e) {
       debugPrint('RemoteStorage.saveReport: local save failed: $e');
       rethrow;

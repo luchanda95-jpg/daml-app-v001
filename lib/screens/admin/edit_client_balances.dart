@@ -6,6 +6,7 @@
 // ignore_for_file: use_build_context_synchronously, unnecessary_type_check, curly_braces_in_flow_structures
 
 import 'package:flutter/material.dart';
+import 'package:daml/widgets/app_skeleton.dart';
 import 'package:intl/intl.dart';
 
 class EditClientBalancesScreen extends StatefulWidget {
@@ -317,7 +318,7 @@ class _EditClientBalancesScreenState extends State<EditClientBalancesScreen> {
         ],
       ),
       body: _loading
-          ? const Center(child: CircularProgressIndicator())
+          ? const AppPageSkeleton()
           : Padding(
               padding: const EdgeInsets.all(12.0),
               child: Form(
